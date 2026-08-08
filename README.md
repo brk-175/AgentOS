@@ -47,6 +47,7 @@ See `docs/` for the full runbook. Quick start:
 ```bash
 cp .env.example .env        # fill in secrets (see .env.example)
 make dev                    # docker compose up
+make install                # Poetry: backend deps + dev tools
 make migrate                # run DB migrations
 ```
 
