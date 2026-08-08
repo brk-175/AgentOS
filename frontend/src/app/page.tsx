@@ -95,17 +95,17 @@ export default function LandingPage() {
   return (
     <div className="relative min-h-screen bg-background text-foreground">
       <header className="sticky top-0 z-50 border-b border-border/60 bg-background/80 backdrop-blur-md">
-        <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-6">
+        <div className="mx-auto flex h-16 max-w-8xl items-center justify-between px-8">
           <Link href="/" className="flex items-center gap-2">
             <span className="flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
               <Boxes className="size-4.5" />
             </span>
-            <span className="text-sm font-semibold tracking-tight">AgentOS</span>
+            <span className="text-xl font-semibold tracking-tight">AgentOS</span>
           </Link>
-          <Button size="sm" render={<Link href={GITHUB_LOGIN_URL} />}>
-              <GithubMark className="size-4" />
-              Continue with GitHub
-            </Button>
+          <Button nativeButton={false} size="sm" render={<Link href={GITHUB_LOGIN_URL} />}>
+            <GithubMark className="size-4" />
+            Continue with GitHub
+          </Button>
         </div>
       </header>
 
@@ -134,11 +134,11 @@ export default function LandingPage() {
               review the change instead of writing it from scratch.
             </p>
             <div className="mt-10 flex flex-col items-center justify-center gap-3 sm:flex-row">
-              <Button size="lg" className="w-full sm:w-auto" render={<Link href={GITHUB_LOGIN_URL} />}>
-                  <GithubMark className="size-4" />
-                  Continue with GitHub
-                </Button>
-              <Button variant="outline" size="lg" className="w-full sm:w-auto" render={<Link href="#how-it-works" />}>See how it works</Button>
+              <Button nativeButton={false} size="lg" className="w-full sm:w-auto" render={<Link href={GITHUB_LOGIN_URL} />}>
+                <GithubMark className="size-4" />
+                Continue with GitHub
+              </Button>
+              <Button nativeButton={false} variant="outline" size="lg" className="w-full sm:w-auto" render={<Link href="#how-it-works" />}>See how it works</Button>
             </div>
           </div>
         </section>
@@ -220,10 +220,10 @@ export default function LandingPage() {
               <br />
               <span className="text-muted-foreground">Keep the review for your engineers.</span>
             </h2>
-            <Button size="lg" className="mt-8" render={<Link href={GITHUB_LOGIN_URL} />}>
-                <GithubMark className="size-4" />
-                Continue with GitHub
-              </Button>
+            <Button nativeButton={false} size="lg" className="mt-8" render={<Link href={GITHUB_LOGIN_URL} />}>
+              <GithubMark className="size-4" />
+              Continue with GitHub
+            </Button>
           </div>
         </section>
       </main>
