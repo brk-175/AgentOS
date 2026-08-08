@@ -46,9 +46,11 @@ See `docs/` for the full runbook. Quick start:
 
 ```bash
 cp .env.example .env        # fill in secrets (see .env.example)
-make dev                    # docker compose up
+make dev                    # start Postgres + Redis (docker compose)
 make install                # Poetry: backend deps + dev tools
 make migrate                # run DB migrations
+make backend-dev            # FastAPI on :8000 (reload)  → another terminal
+make frontend-dev           # Next.js on :3000            → another terminal
 ```
 
 ## Contributing
