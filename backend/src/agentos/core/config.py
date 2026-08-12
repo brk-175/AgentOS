@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     github_client_id: str = Field(init=False)
     github_client_secret: str = Field(init=False)
     github_oauth_callback_url: str = Field(init=False)
+    github_scope: str = Field(init=False)
+
+    # --- Frontend / cookies ---
+    frontend_url: str = Field(init=False)
+    cookie_secure: bool = Field(init=False)
 
     # --- Secrets ---
     secret_key: str = Field(init=False)

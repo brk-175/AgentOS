@@ -32,6 +32,16 @@ services:
       retries: 10
     restart: unless-stopped
 
+  adminer:
+    image: adminer:latest
+    container_name: agentos-adminer
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   pgdata:
   redisdata:

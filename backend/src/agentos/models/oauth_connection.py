@@ -31,6 +31,6 @@ class OAuthConnection(Base, TimestampMixin):
     )
     provider: Mapped[str] = mapped_column(default="github")
     access_token_encrypted: Mapped[str] = mapped_column()  # Fernet ciphertext
-    token_type: Mapped[str] = mapped_column(default="bearer")
+    token_type: Mapped[str] = mapped_column(default="Bearer")
     scope: Mapped[str] = mapped_column(default="")  # space-joined scope list
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
