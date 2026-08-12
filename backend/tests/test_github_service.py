@@ -1,6 +1,6 @@
 """GitHub REST client tests via httpx.MockTransport (no network)."""
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable, Coroutine
 
 import httpx
 import pytest
@@ -37,14 +37,17 @@ PAGE_2 = [
 ]
 NEXT_URL = f"{github.GITHUB_API_URL}/user/repos?sort=updated&per_page=100&page=2"
 
-Handler = Callable[[httpx.Request], Awaitable[httpx.Response]]
+Handler = (
+    Callable[[httpx.Request], httpx.Response]
+    | Callable[[httpx.Request], Coroutine[None, None, httpx.Response]]
+)
 
 
 def _mock_client(monkeypatch: pytest.MonkeyPatch, handler: Handler) -> None:
     real_client = httpx.AsyncClient
 
-    def factory(**kwargs: object) -> httpx.AsyncClient:
-        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+    def factory(timeout: float) -> httpx.AsyncClient:
+        return real_client(transport=httpx.MockTransport(handler), timeout=timeout)
 
     monkeypatch.setattr(github.httpx, "AsyncClient", factory)
 

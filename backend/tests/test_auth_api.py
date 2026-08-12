@@ -1,25 +1,19 @@
 """GitHub OAuth endpoint tests: login redirect, callback, session, me, logout.
 
-Uses an ASGI transport + in-memory sqlite (dependency override for
-``get_db``) and monkeypatched GitHub service calls — no network, no Postgres.
+Uses the shared ASGI + in-memory sqlite fixtures (see conftest.py) and
+monkeypatched GitHub service calls — no network, no Postgres.
 """
-
-from collections.abc import AsyncIterator
 
 import httpx
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.pool import StaticPool
 
-from agentos.app import create_app
 from agentos.core.config import get_settings
 from agentos.core.security import TokenCipher, get_session_tokens
-from agentos.db.session import get_db
-from agentos.models.base import Base
 from agentos.models.oauth_connection import OAuthConnection
 from agentos.models.user import User
 from agentos.services import github_oauth
+from tests.conftest import DbFactory
 
 TEST_PROFILE = {
     "id": 42424242,
@@ -33,36 +27,6 @@ LOGIN_PATH = "/api/v1/auth/github/login"
 CALLBACK_PATH = "/api/v1/auth/github/callback"
 ME_PATH = "/api/v1/auth/me"
 LOGOUT_PATH = "/api/v1/auth/logout"
-
-
-@pytest.fixture()
-async def _db() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    engine = create_async_engine(
-        "sqlite+aiosqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    try:
-        yield factory
-    finally:
-        await engine.dispose()
-
-
-@pytest.fixture()
-async def client(_db: async_sessionmaker[AsyncSession]) -> AsyncIterator[httpx.AsyncClient]:
-    app = create_app()
-
-    async def override_db() -> AsyncIterator[AsyncSession]:
-        async with _db() as session:
-            yield session
-
-    app.dependency_overrides[get_db] = override_db
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as test_client:
-        yield test_client
 
 
 async def _login_and_state(client: httpx.AsyncClient) -> str:
@@ -97,7 +61,7 @@ async def test_login_redirects_to_github(client: httpx.AsyncClient) -> None:
 async def test_callback_happy_path(
     client: httpx.AsyncClient,
     patch_github: None,
-    _db: async_sessionmaker[AsyncSession],
+    db_factory: DbFactory,
 ) -> None:
     state = await _login_and_state(client)
     response = await client.get(
@@ -113,7 +77,7 @@ async def test_callback_happy_path(
     assert body["username"] == "agentos-test"
     assert body["github_id"] == TEST_PROFILE["id"]
 
-    async with _db() as session:
+    async with db_factory() as session:
         stored_user = (await session.execute(select(User))).scalar_one()
         stored_conn = (await session.execute(select(OAuthConnection))).scalar_one()
         cipher = TokenCipher(get_settings().fernet_key)
@@ -154,10 +118,8 @@ async def test_me_requires_session(client: httpx.AsyncClient) -> None:
     assert response.status_code == 401
 
 
-async def test_me_with_stored_connection(
-    client: httpx.AsyncClient, _db: async_sessionmaker[AsyncSession]
-) -> None:
-    async with _db() as session:
+async def test_me_with_stored_connection(client: httpx.AsyncClient, db_factory: DbFactory) -> None:
+    async with db_factory() as session:
         user = User(github_id=999999, username="seeded-user")
         session.add(user)
         await session.flush()
@@ -180,10 +142,8 @@ async def test_me_with_stored_connection(
     assert response.json()["username"] == "seeded-user"
 
 
-async def test_me_requires_connection(
-    client: httpx.AsyncClient, _db: async_sessionmaker[AsyncSession]
-) -> None:
-    async with _db() as session:
+async def test_me_requires_connection(client: httpx.AsyncClient, db_factory: DbFactory) -> None:
+    async with db_factory() as session:
         user = User(github_id=999998, username="no-connection")
         session.add(user)
         await session.commit()
@@ -193,9 +153,9 @@ async def test_me_requires_connection(
 
 
 async def test_me_rejects_unreadable_token(
-    client: httpx.AsyncClient, _db: async_sessionmaker[AsyncSession]
+    client: httpx.AsyncClient, db_factory: DbFactory
 ) -> None:
-    async with _db() as session:
+    async with db_factory() as session:
         user = User(github_id=999997, username="bad-token")
         session.add(user)
         await session.flush()
