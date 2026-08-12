@@ -14,7 +14,7 @@ from sqlalchemy.pool import StaticPool
 
 from agentos.app import create_app
 from agentos.core.config import get_settings
-from agentos.core.security import TokenCipher
+from agentos.core.security import TokenCipher, get_session_tokens
 from agentos.db.session import get_db
 from agentos.models.base import Base
 from agentos.models.oauth_connection import OAuthConnection
@@ -152,6 +152,64 @@ async def test_callback_github_error(client: httpx.AsyncClient, patch_github: No
 async def test_me_requires_session(client: httpx.AsyncClient) -> None:
     response = await client.get(ME_PATH)
     assert response.status_code == 401
+
+
+async def test_me_with_stored_connection(
+    client: httpx.AsyncClient, _db: async_sessionmaker[AsyncSession]
+) -> None:
+    async with _db() as session:
+        user = User(github_id=999999, username="seeded-user")
+        session.add(user)
+        await session.flush()
+        session.add(
+            OAuthConnection(
+                user_id=user.id,
+                provider="github",
+                access_token_encrypted=TokenCipher(get_settings().fernet_key).encrypt_token(
+                    "gho_seeded_token"
+                ),
+                token_type="bearer",
+                scope="repo",
+            )
+        )
+        await session.commit()
+        user_id = user.id
+    client.cookies.set("agentos_session", get_session_tokens().create(user_id))
+    response = await client.get(ME_PATH)
+    assert response.status_code == 200
+    assert response.json()["username"] == "seeded-user"
+
+
+async def test_me_requires_connection(
+    client: httpx.AsyncClient, _db: async_sessionmaker[AsyncSession]
+) -> None:
+    async with _db() as session:
+        user = User(github_id=999998, username="no-connection")
+        session.add(user)
+        await session.commit()
+        user_id = user.id
+    client.cookies.set("agentos_session", get_session_tokens().create(user_id))
+    assert (await client.get(ME_PATH)).status_code == 401
+
+
+async def test_me_rejects_unreadable_token(
+    client: httpx.AsyncClient, _db: async_sessionmaker[AsyncSession]
+) -> None:
+    async with _db() as session:
+        user = User(github_id=999997, username="bad-token")
+        session.add(user)
+        await session.flush()
+        session.add(
+            OAuthConnection(
+                user_id=user.id,
+                provider="github",
+                access_token_encrypted="not-valid-ciphertext",
+            )
+        )
+        await session.commit()
+        user_id = user.id
+    client.cookies.set("agentos_session", get_session_tokens().create(user_id))
+    assert (await client.get(ME_PATH)).status_code == 401
 
 
 async def test_logout_clears_session(client: httpx.AsyncClient, patch_github: None) -> None:

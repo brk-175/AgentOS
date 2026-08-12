@@ -10,19 +10,16 @@ from __future__ import annotations
 
 import hmac
 import secrets
-import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Request, Response
 from fastapi.responses import RedirectResponse
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
+from agentos.api.deps import SESSION_COOKIE, AuthContext, DbSession
 from agentos.core.config import get_settings
 from agentos.core.logging import get_logger
 from agentos.core.security import SESSION_TTL_SECONDS, get_session_tokens, get_token_cipher
-from agentos.db.session import get_db
 from agentos.models.oauth_connection import OAuthConnection
 from agentos.models.user import User
 from agentos.services import github_oauth
@@ -32,11 +29,8 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 STATE_COOKIE = "agentos_oauth_state"
-SESSION_COOKIE = "agentos_session"
 STATE_TTL_SECONDS = 600
 _GITHUB_PROVIDER = "github"
-
-DbSession = Annotated[AsyncSession, Depends(get_db)]
 
 
 def _redirect_with_error(error: str) -> RedirectResponse:
@@ -144,24 +138,12 @@ async def github_callback(
     return response
 
 
-def _authenticated_user_id(request: Request) -> uuid.UUID | None:
-    token = request.cookies.get(SESSION_COOKIE)
-    if not token:
-        return None
-    return get_session_tokens().verify(token)
-
-
 @router.get("/me")
-async def me(request: Request, db: DbSession) -> dict:
+async def me(auth: AuthContext) -> dict:
     """Return the current user from the session cookie, or 401."""
-    user_id = _authenticated_user_id(request)
-    if user_id is None:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    user = await db.get(User, user_id)
-    if user is None:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+    user = auth.user
     return {
-        "id": str(user_id),
+        "id": str(user.id),
         "github_id": user.github_id,
         "username": user.username,
         "name": user.name,
