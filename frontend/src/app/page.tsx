@@ -100,7 +100,7 @@ export default function LandingPage() {
             <span className="flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
               <Boxes className="size-4.5" />
             </span>
-            <span className="text-xl font-semibold tracking-tight">AgentOS</span>
+            <span className="text-xl font-semibold tracking-tight ml-1">AgentOS</span>
           </Link>
           <Button nativeButton={false} size="sm" render={<Link href={GITHUB_LOGIN_URL} />}>
             <GithubMark className="size-4" />

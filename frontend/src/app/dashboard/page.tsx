@@ -81,7 +81,7 @@ export default function DashboardPage() {
                 {user.name ?? user.username}
               </span>
               <Separator orientation="vertical" className="h-5" />
-              <Button nativeButton={false} variant="ghost" size="sm" onClick={handleLogout}>
+              <Button variant="ghost" size="sm" onClick={handleLogout}>
                 <LogOut className="size-3.5" />
                 Log out
               </Button>
@@ -102,7 +102,7 @@ export default function DashboardPage() {
                   Pick a repository to investigate an issue or pull request.
                 </p>
               </div>
-              <Button nativeButton={false} variant="outline" size="sm" onClick={() => void loadRepos()} disabled={reposLoading}>
+              <Button variant="outline" size="sm" onClick={() => void loadRepos()} disabled={reposLoading}>
                 <RefreshCw className={`size-3.5 ${reposLoading ? "animate-spin" : ""}`} />
                 Refresh
               </Button>
