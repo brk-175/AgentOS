@@ -13,6 +13,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
 import redis.asyncio as aioredis
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from agentos.api import api_router
@@ -81,6 +82,13 @@ def create_app() -> FastAPI:
         title="AgentOS API",
         version="0.1.0",
         lifespan=_build_lifespan(settings),
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[settings.frontend_url],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
     app.include_router(api_router, prefix=settings.api_prefix)
     return app
