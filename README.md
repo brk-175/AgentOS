@@ -31,7 +31,7 @@ Browser (Next.js) → FastAPI → Celery worker → LangGraph agent
 
 ```
 backend/            FastAPI application (api, services, agent, rag, mcp client)
-github-mcp-server/  Standalone GitHub MCP server (stdio)
+mcp-servers/        Standalone MCP servers (github-mcp-server: GitHub tools, stdio)
 frontend/           Next.js application
 eval/               Golden dataset + evaluation reports
 deploy/             Docker + Kubernetes manifests
