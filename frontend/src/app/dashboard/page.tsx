@@ -81,7 +81,7 @@ export default function DashboardPage() {
                 {user.name ?? user.username}
               </span>
               <Separator orientation="vertical" className="h-5" />
-              <Button variant="ghost" size="sm" onClick={handleLogout}>
+              <Button variant="ghost" size="sm" className="cursor-pointer" onClick={handleLogout}>
                 <LogOut className="size-3.5" />
                 Log out
               </Button>
