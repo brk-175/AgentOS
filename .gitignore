@@ -47,3 +47,6 @@ deploy/docker/*.env
 *.sqlite3
 eval/reports/*.json
 data/
+
+# TEMP folder
+TEMP/
