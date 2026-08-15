@@ -5,8 +5,8 @@ after ``apply`` (the run ends early when nothing could be applied).
 ``investigate`` loads the target through the MCP tools, gathers repo context
 and asks the LLM for a summary + root-cause hypothesis; ``design`` asks the
 LLM for the structured per-file changes; ``apply`` creates the branch and
-commits the changes through MCP. ``pr`` remains a stub and gains its work in
-Stage 4.4.
+commits the changes through MCP; ``pr`` writes the LLM-generated PR summary
+and opens the pull request.
 """
 
 from __future__ import annotations
@@ -57,6 +57,17 @@ Never truncate a file: "content" must always be the complete file.
 No prose outside the JSON array."""
 
 _MAX_COMMIT_MESSAGE = 120
+
+_PR_PROMPT = """You are the pull-request stage of a GitHub code-fix agent.
+Given the target, the investigation and the exact changes, write the pull
+request summary a maintainer needs to review this fix.
+
+Return STRICT JSON with exactly two keys:
+- "title": a short, imperative summary of the change (max ~72 chars)
+- "body": a concise markdown description: what was wrong, what changed
+  (file by file), and how it was verified
+
+No prose outside the JSON object."""
 
 
 def create_agent_llm() -> BaseChatModel:
@@ -371,12 +382,99 @@ async def apply_node(
     return {"applied_branch": branch, "events": events}
 
 
-async def pr_node(state: AgentState) -> dict[str, Any]:
-    """Open the pull request and finish the run (Stage 4.4)."""
-    return {
-        "pr_url": None,
-        "events": [RunEvent(stage="pr", kind="pr", detail="pull request pending")],
-    }
+async def pr_node(
+    state: AgentState,
+    *,
+    model: BaseChatModel | None,
+    tools: Sequence[BaseTool],
+    token: str | None,
+) -> dict[str, Any]:
+    """Open the pull request: LLM-written title/body, created via MCP.
+
+    Runs only when ``apply`` produced a branch (see ``_after_apply``);
+    the fallbacks below cover partial/dry-run configurations defensively.
+    """
+    target = state["target"]
+    events: list[RunEvent] = []
+    if model is None and not tools and token is None:
+        return {
+            "pr_url": None,
+            "events": [RunEvent(stage="pr", kind="pr", detail="pull request pending")],
+        }
+    apply_branch = state["applied_branch"]
+    if not apply_branch:
+        events.append(
+            RunEvent(stage="pr", kind="error", detail="no applied branch to open a PR from")
+        )
+        return {"pr_url": None, "events": events}
+    if token is None:
+        events.append(
+            RunEvent(stage="pr", kind="error", detail="GITHUB_TOKEN required to open a PR")
+        )
+        return {"pr_url": None, "events": events}
+    pr_tool = _tool(tools, "create_pull_request")
+    if pr_tool is None:
+        events.append(
+            RunEvent(stage="pr", kind="error", detail="MCP create_pull_request tool not available")
+        )
+        return {"pr_url": None, "events": events}
+
+    changed = [
+        change.model_dump(include={"path", "delete"}) for change in state["proposed_changes"]
+    ]
+    investigation = state["investigation"] or ""
+    title = f"Fix {target.kind} #{target.number}: {investigation[:60]}"
+    body = (
+        f"Fixes {target.repo_full_name} {target.kind} #{target.number}.\n\n"
+        f"## Investigation\n{investigation}\n\n"
+        f"## Changes\n" + "\n".join(f"- {entry['path']}" for entry in changed)
+    )
+    if model is not None:
+        try:
+            response = await model.ainvoke(
+                [
+                    SystemMessage(content=_PR_PROMPT),
+                    HumanMessage(
+                        content=(
+                            f"Target: {target.repo_full_name} {target.kind} #{target.number}\n"
+                            f"Investigation: {state['investigation']}\n"
+                            f"Root-cause hypothesis: {state['root_cause_hypothesis'] or '(none)'}\n"
+                            f"Applicable changes: {json.dumps(changed)}"
+                        )[:MAX_PROMPT_CONTEXT]
+                    ),
+                ]
+            )
+            parsed = _extract_json(str(response.content))
+            llm_title = str(parsed.get("title") or "").strip()
+            llm_body = str(parsed.get("body") or "").strip()
+            if not llm_title or not llm_body:
+                raise ValueError("model returned an incomplete PR summary")
+            title, body = llm_title[:72], llm_body
+        except Exception:
+            pass
+    events.append(RunEvent(stage="pr", kind="summary", detail=title))
+
+    owner, _, repo = target.repo_full_name.partition("/")
+    try:
+        result = json.loads(
+            await pr_tool.ainvoke(
+                {
+                    "owner": owner,
+                    "name": repo,
+                    "title": title,
+                    "head": apply_branch,
+                    "base": target.base_branch,
+                    "body": body,
+                }
+            )
+        )
+        pr_url = str(result.get("url") or "")
+        number = str(result.get("number") or "?")
+    except Exception as exc:
+        events.append(RunEvent(stage="pr", kind="error", detail=f"pr failed: {exc}"))
+        return {"pr_url": None, "events": events}
+    events.append(RunEvent(stage="pr", kind="pr", detail=f"opened PR #{number}: {pr_url}"))
+    return {"pr_url": pr_url, "events": events}
 
 
 def _investigate_with(
@@ -411,6 +509,17 @@ def _apply_with(
     return node
 
 
+def _pr_with(
+    model: BaseChatModel | None, tools: Sequence[BaseTool], token: str | None
+) -> Callable[[AgentState], Awaitable[dict[str, Any]]]:
+    """Closure binding model+tools+token into the PR node."""
+
+    async def node(state: AgentState) -> dict[str, Any]:
+        return await pr_node(state, model=model, tools=tools, token=token)
+
+    return node
+
+
 def _after_apply(pass_through: bool) -> Callable[[AgentState], str]:
     """Route after ``apply``: open the PR when a branch exists. In stub mode
     (pass_through) the pipeline keeps its linear demo shape."""
@@ -431,15 +540,16 @@ def create_agent_graph(
     """Build and compile the fix-agent pipeline.
 
     ``model`` and ``tools`` are bound into the investigate node, ``tools`` +
-    ``token`` into apply. Without model/tools/token the graph runs in
-    deterministic stub mode (useful for tests/demo).
+    ``token`` into apply and the model/tools/token into the PR node. Without
+    model/tools/token the graph runs in deterministic stub mode (useful for
+    tests/demo).
     """
     pass_through = model is None and not tools and token is None
     builder = StateGraph(AgentState)
     builder.add_node("investigate", cast(Any, _investigate_with(model, tools)))
     builder.add_node("design", cast(Any, _design_with(model)))
     builder.add_node("apply", cast(Any, _apply_with(tools, token)))
-    builder.add_node("pr", pr_node)
+    builder.add_node("pr", cast(Any, _pr_with(model, tools, token)))
     builder.add_edge(START, "investigate")
     builder.add_edge("investigate", "design")
     builder.add_edge("design", "apply")

@@ -219,9 +219,29 @@ async def test_design_invalid_patch_falls_back() -> None:
     assert "error" in [event.kind for event in final["events"]]
 
 
+PR_JSON = json.dumps(
+    {
+        "number": 42,
+        "url": "https://github.com/octocat/Hello-World/pull/42",
+    }
+)
+PR_TOOL = make_tool(
+    "create_pull_request",
+    PR_JSON,
+)
+
+PR_SUMMARY_JSON = json.dumps(
+    {
+        "title": "fix: default args so the app stops crashing",
+        "body": "## What\nAdds default CLI args.\n\n## Files\n- entrypoint.py",
+    }
+)
+
+
 async def test_full_run_creates_branch_and_commit() -> None:
     branch_calls: list[dict[str, Any]] = []
     commit_calls: list[dict[str, Any]] = []
+    pr_calls: list[dict[str, Any]] = []
     tools = [
         *PLAIN_TOOLS,
         make_tool(
@@ -234,12 +254,14 @@ async def test_full_run_creates_branch_and_commit() -> None:
             json.dumps({"branch": "fix/issue-1", "commit_sha": "c0ffee123456"}),
             commit_calls,
         ),
+        make_tool("create_pull_request", PR_JSON, pr_calls),
     ]
     graph = create_agent_graph(
-        model=FakeModel(MODEL_JSON, DESIGN_JSON), tools=tools, token="ght_test"
+        model=FakeModel(MODEL_JSON, DESIGN_JSON, PR_SUMMARY_JSON), tools=tools, token="ght_test"
     )
     final = await graph.ainvoke(dict(ISSUE_INPUT))
     assert final["applied_branch"] == "fix/issue-1"
+    assert final["pr_url"] == "https://github.com/octocat/Hello-World/pull/42"
     assert [event.kind for event in final["events"]] == [
         "target",
         "context",
@@ -247,8 +269,12 @@ async def test_full_run_creates_branch_and_commit() -> None:
         "design",
         "branch",
         "commit",
+        "summary",
         "pr",
     ]
+    assert final["events"][-1].detail == (
+        "opened PR #42: https://github.com/octocat/Hello-World/pull/42"
+    )
     assert branch_calls[0] == {
         "tool": "create_branch",
         "owner": "octocat",
@@ -266,6 +292,49 @@ async def test_full_run_creates_branch_and_commit() -> None:
         },
         {"path": "legacy.py", "content": "", "delete": True},
     ]
+    assert pr_calls[0] == {
+        "tool": "create_pull_request",
+        "owner": "octocat",
+        "name": "Hello-World",
+        "title": "fix: default args so the app stops crashing",
+        "head": "fix/issue-1",
+        "base": "main",
+        "body": "## What\nAdds default CLI args.\n\n## Files\n- entrypoint.py",
+    }
+
+
+async def test_pr_opens_with_fallback_when_summary_fails() -> None:
+    tools = [
+        *PLAIN_TOOLS,
+        make_tool("create_branch", json.dumps({"sha": "ABC123"})),
+        make_tool("create_commit", json.dumps({"commit_sha": "c0ffee123456"})),
+        make_tool("create_pull_request", PR_JSON),
+    ]
+    graph = create_agent_graph(
+        model=FakeModel(MODEL_JSON, DESIGN_JSON, "this is not json"),
+        tools=tools,
+        token="ght_test",
+    )
+    final = await graph.ainvoke(dict(ISSUE_INPUT))
+    assert final["pr_url"] == "https://github.com/octocat/Hello-World/pull/42"
+    summary = next(e for e in final["events"] if e.kind == "summary")
+    assert summary.detail.startswith("Fix issue #1: App crashes when run without arguments.")
+
+
+async def test_pr_missing_tool_ends_with_error() -> None:
+    tools = [
+        *PLAIN_TOOLS,
+        make_tool("create_branch", json.dumps({"sha": "ABC123"})),
+        make_tool("create_commit", json.dumps({"commit_sha": "c0ffee123456"})),
+    ]
+    graph = create_agent_graph(
+        model=FakeModel(MODEL_JSON, DESIGN_JSON), tools=tools, token="ght_test"
+    )
+    final = await graph.ainvoke(dict(ISSUE_INPUT))
+    assert final["applied_branch"] == "fix/issue-1"
+    assert final["pr_url"] is None
+    assert final["events"][-1].kind == "error"
+    assert final["events"][-1].detail.startswith("MCP create_pull_request tool not available")
 
 
 async def test_full_run_uses_custom_base_branch() -> None:
@@ -274,6 +343,7 @@ async def test_full_run_uses_custom_base_branch() -> None:
         *PLAIN_TOOLS,
         make_tool("create_branch", json.dumps({"sha": "ABC123"}), branch_calls),
         make_tool("create_commit", json.dumps({"commit_sha": "c0ffee123456"})),
+        make_tool("create_pull_request", PR_JSON),
     ]
     graph = create_agent_graph(
         model=FakeModel(MODEL_JSON, DESIGN_JSON),
@@ -285,6 +355,7 @@ async def test_full_run_uses_custom_base_branch() -> None:
     )
     final = await graph.ainvoke(dict(ISSUE_INPUT, target=target))
     assert final["applied_branch"] == "fix/issue-9"
+    assert final["pr_url"] is not None
     assert branch_calls[0]["base_branch"] == "trunk"
 
 
