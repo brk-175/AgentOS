@@ -48,5 +48,6 @@ deploy/docker/*.env
 eval/reports/*.json
 data/
 
-# TEMP folder
+# TEMP and scripts folder
 TEMP/
+backend/scripts/
