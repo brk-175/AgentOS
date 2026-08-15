@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
 from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.tools import StructuredTool, ToolException
 from langchain_openai import ChatOpenAI
 
 from agentos.agent.graph import create_agent_graph, create_agent_llm
@@ -64,7 +67,7 @@ async def test_graph_invoke_produces_full_state_and_trace() -> None:
     assert stages == ["investigate", "design", "apply", "pr"]
 
 
-async def test_live_github_mcp_tools_exposes_all_five_tools() -> None:
+async def test_live_github_mcp_tools_exposes_all_eight_tools() -> None:
     """End-to-end: boot the real MCP server over stdio and list its tools."""
     try:
         adapter = GitHubMCPTools()
@@ -76,6 +79,9 @@ async def test_live_github_mcp_tools_exposes_all_five_tools() -> None:
     assert {
         "list_repo_files",
         "read_file",
+        "get_issue",
+        "get_pr",
+        "get_pr_diff",
         "create_branch",
         "create_commit",
         "create_pull_request",
@@ -93,3 +99,83 @@ async def test_live_tool_call_against_public_repo() -> None:
         listing_tool = next(t for t in bound.tools if t.name == "list_repo_files")
         raw = await listing_tool.ainvoke({"owner": "octocat", "name": "Hello-World"})
     assert "README" in raw
+
+
+class FakeModel:
+    """Minimal stand-in for ``BaseChatModel`` that returns canned JSON."""
+
+    def __init__(self, content: str) -> None:
+        self._content = content
+
+    async def ainvoke(self, messages: list[Any]) -> AIMessage:
+        return AIMessage(content=self._content)
+
+
+def make_tool(name: str, body: str | Exception) -> StructuredTool:
+    """A LangChain tool returning canned text or raising a given error."""
+
+    async def invoke(**kwargs: Any) -> str:
+        if isinstance(body, Exception):
+            raise body
+        return body
+
+    return StructuredTool.from_function(
+        coroutine=invoke, name=name, description=name, infer_schema=False
+    )
+
+
+ISSUE_JSON = json.dumps(
+    {
+        "number": 1,
+        "title": "App crashes on empty input",
+        "state": "open",
+        "reporter": "octo",
+        "labels": ["bug"],
+        "body": "Repro: run the app with no arguments.",
+        "comments": [],
+    }
+)
+LISTING_JSON = json.dumps([{"kind": "file", "name": "README.md", "path": "README.md", "size": 120}])
+PLAIN_TOOLS = [
+    make_tool("get_issue", ISSUE_JSON),
+    make_tool("list_repo_files", LISTING_JSON),
+    make_tool("read_file", "# AgentOS\ndemo repo\n"),
+]
+MODEL_JSON = (
+    '{"investigation": "App crashes when run without arguments.",'
+    ' "root_cause_hypothesis": "missing null check in the entrypoint"}'
+)
+
+
+async def test_investigate_uses_tools_and_model() -> None:
+    graph = create_agent_graph(model=FakeModel(MODEL_JSON), tools=PLAIN_TOOLS)
+    final = await graph.ainvoke(dict(ISSUE_INPUT))
+    assert final["investigation"] == "App crashes when run without arguments."
+    assert final["root_cause_hypothesis"] == "missing null check in the entrypoint"
+    assert [event.kind for event in final["events"]] == [
+        "target",
+        "context",
+        "hypothesis",
+        "design",
+        "apply",
+        "pr",
+    ]
+    assert final["events"][0].detail.startswith("issue #1 loaded")
+    assert final["events"][1].detail == "read 1 file(s)"
+
+
+async def test_investigate_tool_error_falls_back_gracefully() -> None:
+    tools = [make_tool("get_issue", ToolException("boom"))]
+    graph = create_agent_graph(model=FakeModel(MODEL_JSON), tools=tools)
+    final = await graph.ainvoke(dict(ISSUE_INPUT))
+    assert final["root_cause_hypothesis"] == ""
+    assert "Could not load issue #1" in final["investigation"]
+    assert final["events"][0].kind == "error"
+
+
+async def test_investigate_invalid_model_json_falls_back() -> None:
+    graph = create_agent_graph(model=FakeModel("definitely not json"), tools=PLAIN_TOOLS)
+    final = await graph.ainvoke(dict(ISSUE_INPUT))
+    assert final["root_cause_hypothesis"] == ""
+    assert "Analyzed" in final["investigation"]
+    assert "error" in [event.kind for event in final["events"]]

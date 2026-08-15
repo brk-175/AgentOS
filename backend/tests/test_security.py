@@ -56,7 +56,9 @@ def test_session_round_trip(sessions: SessionTokens) -> None:
 def test_session_rejects_tampering(sessions: SessionTokens) -> None:
     user_id = uuid.uuid4()
     token = sessions.create(user_id)
-    tampered = token[:-1] + ("A" if token[-1] != "A" else "B")
+    mid = len(token) // 2
+    replacement = "A" if token[mid] != "A" else "B"
+    tampered = token[:mid] + replacement + token[mid + 1 :]
     assert sessions.verify(tampered) is None
 
 

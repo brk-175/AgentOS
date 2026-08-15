@@ -21,13 +21,20 @@ mcp = MCPServer(name="github-mcp-server")
 GITHUB_API_URL = "https://api.github.com"
 HTTP_TIMEOUT_SECONDS = 15.0
 MAX_READ_CHARS = 1_000_000
+MAX_DIFF_CHARS = 200_000
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
 
-def _github_headers(raw: bool = False) -> dict[str, str]:
+def _github_headers(raw: bool = False, diff: bool = False) -> dict[str, str]:
+    if diff:
+        accept = "application/vnd.github.v3.diff"
+    elif raw:
+        accept = "application/vnd.github.raw+json"
+    else:
+        accept = "application/vnd.github+json"
     headers = {
-        "Accept": "application/vnd.github.raw+json" if raw else "application/vnd.github+json",
+        "Accept": accept,
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "AgentOS-MCP",
     }
@@ -104,6 +111,82 @@ async def read_file(owner: str, name: str, path: str) -> str:
     content = response.text
     if len(content) > MAX_READ_CHARS:
         raise ValueError(f"file exceeds {MAX_READ_CHARS} characters — target a smaller file")
+    return content
+
+
+@mcp.tool()
+async def get_issue(owner: str, name: str, number: int) -> dict[str, Any]:
+    """Fetch the details of issue ``number`` in ``owner/name``.
+
+    Returns the title, state, reporter, labels, body, and comment bodies —
+    the context the agent needs to understand the problem. Note that pull
+    requests are issues on GitHub, so this also works for them.
+    """
+    url = f"{GITHUB_API_URL}/repos/{owner}/{name}/issues/{number}"
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+        response = await client.get(url, headers=_github_headers())
+        payload = _json_or_raise(response)
+        comments_response = await client.get(
+            f"{GITHUB_API_URL}/repos/{owner}/{name}/issues/{number}/comments",
+            headers=_github_headers(),
+        )
+        comments = _json_or_raise(comments_response)
+    return {
+        "number": payload["number"],
+        "title": payload["title"],
+        "state": payload["state"],
+        "reporter": payload["user"]["login"],
+        "labels": [label["name"] for label in payload.get("labels", [])],
+        "body": payload.get("body") or "",
+        "comments": [
+            {"user": comment["user"]["login"], "body": comment.get("body") or ""}
+            for comment in comments
+        ],
+    }
+
+
+@mcp.tool()
+async def get_pr(owner: str, name: str, number: int) -> dict[str, Any]:
+    """Fetch the details of pull request ``number`` in ``owner/name``.
+
+    Returns the title, state, author, head/base branches, body, and diff
+    statistics (files changed, additions, deletions) so the agent can
+    evaluate the change without downloading the full diff.
+    """
+    url = f"{GITHUB_API_URL}/repos/{owner}/{name}/pulls/{number}"
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+        response = await client.get(url, headers=_github_headers())
+        payload = _json_or_raise(response)
+    return {
+        "number": payload["number"],
+        "title": payload["title"],
+        "state": payload["state"],
+        "author": payload["user"]["login"],
+        "head": f"{payload['head']['repo']['full_name']}:{payload['head']['ref']}",
+        "base": payload["base"]["ref"],
+        "merged": payload.get("merged", False),
+        "additions": payload.get("additions", 0),
+        "deletions": payload.get("deletions", 0),
+        "changed_files": payload.get("changed_files", 0),
+        "body": payload.get("body") or "",
+    }
+
+
+@mcp.tool()
+async def get_pr_diff(owner: str, name: str, number: int) -> str:
+    """Return the unified diff of pull request ``number`` in ``owner/name``.
+
+    The raw patch text (files, hunks, changed lines) — the primary input
+    for reviewing or fixing a PR. Capped at 200,000 characters; use
+    ``get_pr`` for the summary instead if the diff is too large.
+    """
+    url = f"{GITHUB_API_URL}/repos/{owner}/{name}/pulls/{number}"
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+        response = await client.get(url, headers=_github_headers(diff=True))
+        _check_status(response)
+        content = response.text
+    if len(content) > MAX_DIFF_CHARS:
+        raise ValueError(f"diff exceeds {MAX_DIFF_CHARS} characters — use get_pr for a summary")
     return content
 
 

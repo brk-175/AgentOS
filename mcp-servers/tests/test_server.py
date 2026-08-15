@@ -103,6 +103,112 @@ async def test_read_file_rejects_huge_content(monkeypatch: pytest.MonkeyPatch) -
         await server.read_file("octo", "repo", "big.txt")
 
 
+async def test_get_issue_fetches_details_and_comments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/repos/octo/repo/issues/1":
+            return httpx.Response(
+                200,
+                json={
+                    "number": 1,
+                    "title": "Crash on empty input",
+                    "state": "open",
+                    "user": {"login": "octo"},
+                    "labels": [{"name": "bug"}, {"name": "priority"}],
+                    "body": "App crashes when input is empty.",
+                },
+            )
+        assert request.url.path == "/repos/octo/repo/issues/1/comments"
+        return httpx.Response(
+            200,
+            json=[
+                {"user": {"login": "helper"}, "body": "Reproduced locally."},
+                {"user": {"login": "octo"}, "body": "Thanks!"},
+            ],
+        )
+
+    _mock_client(monkeypatch, handler)
+    result = await server.get_issue("octo", "repo", 1)
+    assert result == {
+        "number": 1,
+        "title": "Crash on empty input",
+        "state": "open",
+        "reporter": "octo",
+        "labels": ["bug", "priority"],
+        "body": "App crashes when input is empty.",
+        "comments": [
+            {"user": "helper", "body": "Reproduced locally."},
+            {"user": "octo", "body": "Thanks!"},
+        ],
+    }
+
+
+async def test_get_issue_404(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    _mock_client(monkeypatch, handler)
+    with pytest.raises(ValueError):
+        await server.get_issue("octo", "repo", 999)
+
+
+async def test_get_pr_fetches_summary(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/octo/repo/pulls/5"
+        return httpx.Response(
+            200,
+            json={
+                "number": 5,
+                "title": "Fix empty input crash",
+                "state": "open",
+                "user": {"login": "octo"},
+                "head": {"repo": {"full_name": "octo/repo"}, "ref": "fix/empty-input"},
+                "base": {"ref": "main"},
+                "merged": False,
+                "additions": 12,
+                "deletions": 2,
+                "changed_files": 1,
+                "body": "Adds a null check.",
+            },
+        )
+
+    _mock_client(monkeypatch, handler)
+    result = await server.get_pr("octo", "repo", 5)
+    assert result == {
+        "number": 5,
+        "title": "Fix empty input crash",
+        "state": "open",
+        "author": "octo",
+        "head": "octo/repo:fix/empty-input",
+        "base": "main",
+        "merged": False,
+        "additions": 12,
+        "deletions": 2,
+        "changed_files": 1,
+        "body": "Adds a null check.",
+    }
+
+
+async def test_get_pr_diff_returns_plain_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/octo/repo/pulls/5"
+        assert request.headers["accept"] == "application/vnd.github.v3.diff"
+        return httpx.Response(200, text="diff --git a/main.py b/main.py\n+fixed\n")
+
+    _mock_client(monkeypatch, handler)
+    assert await server.get_pr_diff("octo", "repo", 5) == "diff --git a/main.py b/main.py\n+fixed\n"
+
+
+async def test_get_pr_diff_rejects_huge_diff(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="x" * (server.MAX_DIFF_CHARS + 1))
+
+    _mock_client(monkeypatch, handler)
+    with pytest.raises(ValueError, match="diff exceeds"):
+        await server.get_pr_diff("octo", "repo", 5)
+
+
 async def test_create_branch_creates_ref(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(server, "GITHUB_TOKEN", "test-token")
 
