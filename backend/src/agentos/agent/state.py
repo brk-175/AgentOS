@@ -26,6 +26,7 @@ class RunTarget(BaseModel):
     kind: Literal["issue", "pr"]
     number: int
     title: str = ""
+    base_branch: str = "main"
 
 
 class FileChange(BaseModel):
@@ -39,6 +40,13 @@ class FileChange(BaseModel):
     content: str = ""
     delete: bool = False
     explanation: str = ""
+
+
+class ContextDoc(BaseModel):
+    """A repository file the investigate node gathered for the design stage."""
+
+    path: str
+    content: str
 
 
 class RunEvent(BaseModel):
@@ -56,6 +64,7 @@ class AgentState(TypedDict):
     target: RunTarget
     messages: Annotated[list[AnyMessage], add_messages]
     events: Annotated[list[RunEvent], operator.add]
+    context: list[ContextDoc]
     investigation: str | None
     root_cause_hypothesis: str | None
     proposed_changes: list[FileChange]

@@ -1,10 +1,12 @@
-"""The fix-agent LangGraph: a linear pipeline of four staged nodes.
+"""The fix-agent LangGraph: a staged pipeline of four nodes.
 
-Topology is fixed here (``investigate -> design -> apply -> pr``).
-``investigate`` is implemented: it loads the target issue/PR through the MCP
-tools, gathers a little repo context, and asks the LLM for the investigation
-summary and root-cause hypothesis. ``design``/``apply``/``pr`` remain
-deterministic stubs and gain their LLM/tool work in later steps.
+Topology: ``investigate -> design -> apply -> pr`` with a conditional edge
+after ``apply`` (the run ends early when nothing could be applied).
+``investigate`` loads the target through the MCP tools, gathers repo context
+and asks the LLM for a summary + root-cause hypothesis; ``design`` asks the
+LLM for the structured per-file changes; ``apply`` creates the branch and
+commits the changes through MCP. ``pr`` remains a stub and gains its work in
+Stage 4.4.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import SecretStr
 
-from agentos.agent.state import AgentState, RunEvent
+from agentos.agent.state import AgentState, ContextDoc, FileChange, RunEvent
 from agentos.core.config import get_settings
 
 MAX_CONTEXT_FILES = 2
@@ -40,6 +42,22 @@ No prose outside the JSON object."""
 
 _PATCHABLE_NAME = re.compile(r"(?i)^(readme|contribut|license)")
 
+_DESIGN_PROMPT = """You are the design stage of a GitHub code-fix agent.
+Given the target, the investigation and the repo context, produce the exact
+file changes that fix the problem and nothing else.
+
+Return STRICT JSON: an ARRAY of change objects. Each object has:
+- "path": repository-relative file path (required)
+- "content": the FULL new file content (for edits and new files); ignored when
+  "delete" is true
+- "delete": optional boolean — true to delete the file (content must be "")
+- "explanation": one short sentence about why this change fixes the issue
+
+Never truncate a file: "content" must always be the complete file.
+No prose outside the JSON array."""
+
+_MAX_COMMIT_MESSAGE = 120
+
 
 def create_agent_llm() -> BaseChatModel:
     """OpenRouter-bound chat model (``ChatOpenAI`` is OpenAI-compatible)."""
@@ -51,16 +69,22 @@ def create_agent_llm() -> BaseChatModel:
     )
 
 
-def _extract_json(text: str) -> dict[str, Any]:
-    """Extract the first JSON object from a model response (fence-tolerant)."""
+def _extract_json(text: str) -> Any:
+    """Extract the first JSON object/array from a model response
+    (fence-tolerant)."""
     cleaned = text.strip()
     if cleaned.startswith("```"):
         cleaned = cleaned.split("```", 2)[1]
         if cleaned.startswith("json"):
             cleaned = cleaned[4:]
-    start, end = cleaned.find("{"), cleaned.rfind("}")
-    if start == -1 or end == -1:
-        raise ValueError("model output contained no JSON object")
+    positions = [index for index in (cleaned.find("{"), cleaned.find("[")) if index != -1]
+    if not positions:
+        raise ValueError("model output contained no JSON object or array")
+    start = min(positions)
+    closer = "}" if cleaned[start] == "{" else "]"
+    end = cleaned.rfind(closer)
+    if end == -1:
+        raise ValueError("model output ended before closing its JSON block")
     return json.loads(cleaned[start : end + 1])
 
 
@@ -82,7 +106,9 @@ async def _fetch_target(tools: Sequence[BaseTool], state: AgentState) -> dict[st
     return payload
 
 
-async def _gather_context(tools: Sequence[BaseTool], state: AgentState) -> tuple[list[str], int]:
+async def _gather_context(
+    tools: Sequence[BaseTool], state: AgentState
+) -> tuple[list[ContextDoc], int]:
     """Read a couple of promising files from the repo root (bounded)."""
     target = state["target"]
     owner, _, repo = target.repo_full_name.partition("/")
@@ -97,12 +123,11 @@ async def _gather_context(tools: Sequence[BaseTool], state: AgentState) -> tuple
         for entry in entries
         if entry.get("kind") == "file" and entry.get("size", 0) <= MAX_FILE_CHARS
     ][:MAX_CONTEXT_FILES]
-    contents: list[str] = []
+    docs: list[ContextDoc] = []
     for path in picked:
-        contents.append(
-            f"### {path}\n{await read_tool.ainvoke({'owner': owner, 'name': repo, 'path': path})}"
-        )
-    return contents, len(picked)
+        content = await read_tool.ainvoke({"owner": owner, "name": repo, "path": path})
+        docs.append(ContextDoc(path=path, content=content))
+    return docs, len(picked)
 
 
 async def investigate_node(
@@ -127,6 +152,7 @@ async def investigate_node(
             ],
         }
     context_parts: list[str] = []
+    context_docs: list[ContextDoc] = []
     files_read = 0
     try:
         details = await _fetch_target(tools, state)
@@ -160,7 +186,8 @@ async def investigate_node(
         events.append(
             RunEvent(stage="investigate", kind="context", detail=f"read {files_read} file(s)")
         )
-    context_parts.extend(context)
+    context_docs.extend(context)
+    context_parts.extend(f"### {doc.path}\n{doc.content}" for doc in context_docs)
 
     if model is None:
         return {
@@ -201,20 +228,147 @@ async def investigate_node(
     }
 
 
-async def design_node(state: AgentState) -> dict[str, Any]:
-    """Produce the structured per-file fix (LLM + patch schema in Stage 4.3)."""
-    return {
-        "proposed_changes": [],
-        "events": [RunEvent(stage="design", kind="design", detail="fix design pending")],
-    }
+async def design_node(
+    state: AgentState,
+    *,
+    model: BaseChatModel | None,
+) -> dict[str, Any]:
+    """Design the fix: ask the LLM for exact per-file changes (strict JSON)."""
+    target = state["target"]
+    events: list[RunEvent] = []
+    if model is None:
+        return {
+            "proposed_changes": [],
+            "events": [RunEvent(stage="design", kind="design", detail="fix design pending")],
+        }
+
+    context_block = (
+        "\n\n".join(f"### {doc.path}\n{doc.content}" for doc in state["context"])
+        or "(no repo context was gathered)"
+    )
+    prompt = (
+        f"Target: {target.repo_full_name} {target.kind} #{target.number}"
+        f" ({target.title or 'no title'})\n"
+        f"Investigation: {state['investigation'] or '(empty)'}\n"
+        f"Root-cause hypothesis: {state['root_cause_hypothesis'] or '(none)'}\n\n"
+        f"Repo context:\n{context_block}"
+    )[:MAX_PROMPT_CONTEXT]
+    try:
+        response = await model.ainvoke(
+            [SystemMessage(content=_DESIGN_PROMPT), HumanMessage(content=prompt)]
+        )
+        raw = _extract_json(str(response.content))
+        if not isinstance(raw, list):
+            raise ValueError("model patch must be a JSON array")
+        changes: list[FileChange] = []
+        for entry in raw:
+            if not isinstance(entry, dict) or not entry.get("path"):
+                continue
+            changes.append(
+                FileChange(
+                    path=str(entry["path"]),
+                    content=str(entry.get("content") or ""),
+                    delete=bool(entry.get("delete", False)),
+                    explanation=str(entry.get("explanation") or ""),
+                )
+            )
+        if not changes:
+            raise ValueError("no valid change entries in model patch")
+    except Exception as exc:
+        events.append(RunEvent(stage="design", kind="error", detail=f"design failed: {exc}"))
+        return {"proposed_changes": [], "events": events}
+
+    paths = ", ".join(c.path for c in changes[:5])
+    events.append(
+        RunEvent(
+            stage="design",
+            kind="design",
+            detail=f"{len(changes)} change(s): {paths}" + ("…" if len(changes) > 5 else ""),
+        )
+    )
+    return {"proposed_changes": changes, "events": events}
 
 
-async def apply_node(state: AgentState) -> dict[str, Any]:
-    """Create the branch and commit the changes through MCP (Stage 4.3)."""
-    return {
-        "applied_branch": None,
-        "events": [RunEvent(stage="apply", kind="apply", detail="changes not yet applied")],
-    }
+async def apply_node(
+    state: AgentState,
+    *,
+    tools: Sequence[BaseTool],
+    token: str | None,
+) -> dict[str, Any]:
+    """Apply the fix: create the branch, then commit the changes via MCP."""
+    target = state["target"]
+    changes = state["proposed_changes"]
+    events: list[RunEvent] = []
+    if token is None and not tools:
+        return {
+            "applied_branch": None,
+            "events": [RunEvent(stage="apply", kind="apply", detail="changes not yet applied")],
+        }
+    if not changes:
+        events.append(
+            RunEvent(stage="apply", kind="error", detail="no changes to apply (design failed?)")
+        )
+        return {"applied_branch": None, "events": events}
+    if token is None:
+        events.append(
+            RunEvent(stage="apply", kind="error", detail="GITHUB_TOKEN required to apply changes")
+        )
+        return {"applied_branch": None, "events": events}
+
+    branch_tool = _tool(tools, "create_branch")
+    commit_tool = _tool(tools, "create_commit")
+    if branch_tool is None or commit_tool is None:
+        events.append(RunEvent(stage="apply", kind="error", detail="MCP write tools not available"))
+        return {"applied_branch": None, "events": events}
+
+    owner, _, repo = target.repo_full_name.partition("/")
+    branch = f"fix/{target.kind}-{target.number}"
+    message = f"AgentOS: fix {target.kind} #{target.number}"
+    if target.title:
+        message = f"{message}: {target.title}"
+    message = message[:_MAX_COMMIT_MESSAGE]
+    payload = [change.model_dump(include={"path", "content", "delete"}) for change in changes]
+    try:
+        branch_result = json.loads(
+            await branch_tool.ainvoke(
+                {
+                    "owner": owner,
+                    "name": repo,
+                    "base_branch": target.base_branch,
+                    "new_branch": branch,
+                }
+            )
+        )
+        events.append(
+            RunEvent(
+                stage="apply",
+                kind="branch",
+                detail=f"created {branch} from {target.base_branch} "
+                f"(sha {str(branch_result.get('sha', ''))[:8]})",
+            )
+        )
+        commit_result = json.loads(
+            await commit_tool.ainvoke(
+                {
+                    "owner": owner,
+                    "name": repo,
+                    "branch": branch,
+                    "message": message,
+                    "changes": payload,
+                }
+            )
+        )
+        events.append(
+            RunEvent(
+                stage="apply",
+                kind="commit",
+                detail=f"commit {str(commit_result.get('commit_sha', ''))[:12]}",
+            )
+        )
+    except Exception as exc:
+        events.append(RunEvent(stage="apply", kind="error", detail=f"apply failed: {exc}"))
+        return {"applied_branch": None, "events": events}
+    return {"applied_branch": branch, "events": events}
 
 
 async def pr_node(state: AgentState) -> dict[str, Any]:
@@ -237,23 +391,58 @@ def _investigate_with(
     return node
 
 
+def _design_with(model: BaseChatModel | None) -> Callable[[AgentState], Awaitable[dict[str, Any]]]:
+    """Closure binding the model into the design node."""
+
+    async def node(state: AgentState) -> dict[str, Any]:
+        return await design_node(state, model=model)
+
+    return node
+
+
+def _apply_with(
+    tools: Sequence[BaseTool], token: str | None
+) -> Callable[[AgentState], Awaitable[dict[str, Any]]]:
+    """Closure binding write tools + token into the apply node."""
+
+    async def node(state: AgentState) -> dict[str, Any]:
+        return await apply_node(state, tools=tools, token=token)
+
+    return node
+
+
+def _after_apply(pass_through: bool) -> Callable[[AgentState], str]:
+    """Route after ``apply``: open the PR when a branch exists. In stub mode
+    (pass_through) the pipeline keeps its linear demo shape."""
+
+    def route(state: AgentState) -> str:
+        if pass_through or state["applied_branch"]:
+            return "pr"
+        return "end"
+
+    return route
+
+
 def create_agent_graph(
     model: BaseChatModel | None = None,
     tools: Sequence[BaseTool] = (),
+    token: str | None = None,
 ) -> CompiledStateGraph:
     """Build and compile the fix-agent pipeline.
 
-    ``model`` and ``tools`` are bound into the investigate node; without
-    them the graph runs in deterministic stub mode (useful for tests/demo).
+    ``model`` and ``tools`` are bound into the investigate node, ``tools`` +
+    ``token`` into apply. Without model/tools/token the graph runs in
+    deterministic stub mode (useful for tests/demo).
     """
+    pass_through = model is None and not tools and token is None
     builder = StateGraph(AgentState)
     builder.add_node("investigate", cast(Any, _investigate_with(model, tools)))
-    builder.add_node("design", design_node)
-    builder.add_node("apply", apply_node)
+    builder.add_node("design", cast(Any, _design_with(model)))
+    builder.add_node("apply", cast(Any, _apply_with(tools, token)))
     builder.add_node("pr", pr_node)
     builder.add_edge(START, "investigate")
     builder.add_edge("investigate", "design")
     builder.add_edge("design", "apply")
-    builder.add_edge("apply", "pr")
+    builder.add_conditional_edges("apply", _after_apply(pass_through), {"pr": "pr", "end": END})
     builder.add_edge("pr", END)
     return builder.compile()

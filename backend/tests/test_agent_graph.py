@@ -13,12 +13,13 @@ from langchain_openai import ChatOpenAI
 
 from agentos.agent.graph import create_agent_graph, create_agent_llm
 from agentos.agent.mcp_adapter import GitHubMCPTools, json_schema_to_model
-from agentos.agent.state import RunTarget
+from agentos.agent.state import FileChange, RunTarget
 
 ISSUE_INPUT: dict[str, Any] = {
     "target": RunTarget(repo_full_name="octocat/Hello-World", kind="issue", number=1),
     "messages": [],
     "events": [],
+    "context": [],
 }
 
 
@@ -102,19 +103,27 @@ async def test_live_tool_call_against_public_repo() -> None:
 
 
 class FakeModel:
-    """Minimal stand-in for ``BaseChatModel`` that returns canned JSON."""
+    """Minimal stand-in for ``BaseChatModel`` serving canned responses in order
+    (the graph calls it once per stage; the last scripted response repeats)."""
 
-    def __init__(self, content: str) -> None:
-        self._content = content
+    def __init__(self, *contents: str) -> None:
+        self._contents = contents or ("{}",)
+        self._index = 0
 
     async def ainvoke(self, messages: list[Any]) -> AIMessage:
-        return AIMessage(content=self._content)
+        content = self._contents[min(self._index, len(self._contents) - 1)]
+        self._index += 1
+        return AIMessage(content=content)
 
 
-def make_tool(name: str, body: str | Exception) -> StructuredTool:
+def make_tool(
+    name: str, body: str | Exception, calls: list[dict[str, Any]] | None = None
+) -> StructuredTool:
     """A LangChain tool returning canned text or raising a given error."""
 
     async def invoke(**kwargs: Any) -> str:
+        if calls is not None:
+            calls.append({"tool": name, **kwargs})
         if isinstance(body, Exception):
             raise body
         return body
@@ -145,10 +154,25 @@ MODEL_JSON = (
     '{"investigation": "App crashes when run without arguments.",'
     ' "root_cause_hypothesis": "missing null check in the entrypoint"}'
 )
+DESIGN_JSON = json.dumps(
+    [
+        {
+            "path": "entrypoint.py",
+            "content": 'def main():\n    args = sys.argv[1:] or ["default"]\n',
+            "explanation": "default arguments so the app no longer crashes",
+        },
+        {
+            "path": "legacy.py",
+            "delete": True,
+            "content": "",
+            "explanation": "dead module removed",
+        },
+    ]
+)
 
 
 async def test_investigate_uses_tools_and_model() -> None:
-    graph = create_agent_graph(model=FakeModel(MODEL_JSON), tools=PLAIN_TOOLS)
+    graph = create_agent_graph(model=FakeModel(MODEL_JSON, "garbage"), tools=PLAIN_TOOLS)
     final = await graph.ainvoke(dict(ISSUE_INPUT))
     assert final["investigation"] == "App crashes when run without arguments."
     assert final["root_cause_hypothesis"] == "missing null check in the entrypoint"
@@ -156,12 +180,144 @@ async def test_investigate_uses_tools_and_model() -> None:
         "target",
         "context",
         "hypothesis",
-        "design",
-        "apply",
-        "pr",
+        "error",
+        "error",
     ]
     assert final["events"][0].detail.startswith("issue #1 loaded")
     assert final["events"][1].detail == "read 1 file(s)"
+
+
+async def test_design_produces_structured_changes() -> None:
+    graph = create_agent_graph(model=FakeModel(MODEL_JSON, DESIGN_JSON), tools=PLAIN_TOOLS)
+    final = await graph.ainvoke(dict(ISSUE_INPUT))
+    assert final["proposed_changes"] == [
+        FileChange(
+            path="entrypoint.py",
+            content='def main():\n    args = sys.argv[1:] or ["default"]\n',
+            delete=False,
+            explanation="default arguments so the app no longer crashes",
+        ),
+        FileChange(path="legacy.py", content="", delete=True, explanation="dead module removed"),
+    ]
+    design = next(e for e in final["events"] if e.stage == "design")
+    assert design.kind == "design"
+    assert design.detail == "2 change(s): entrypoint.py, legacy.py"
+
+
+async def test_design_invalid_patch_falls_back() -> None:
+    graph = create_agent_graph(
+        model=FakeModel(MODEL_JSON, "certainly not an array"),
+        tools=PLAIN_TOOLS,
+    )
+    visited: list[str] = []
+    async for update in graph.astream(dict(ISSUE_INPUT), stream_mode="updates"):
+        visited.extend(update.keys())
+    assert visited == ["investigate", "design", "apply"]
+    final = await graph.ainvoke(dict(ISSUE_INPUT))
+    assert final["proposed_changes"] == []
+    assert final["applied_branch"] is None
+    assert "error" in [event.kind for event in final["events"]]
+
+
+async def test_full_run_creates_branch_and_commit() -> None:
+    branch_calls: list[dict[str, Any]] = []
+    commit_calls: list[dict[str, Any]] = []
+    tools = [
+        *PLAIN_TOOLS,
+        make_tool(
+            "create_branch",
+            json.dumps({"ref": "fix/issue-1", "sha": "ABC123", "base_sha": "XYZ"}),
+            branch_calls,
+        ),
+        make_tool(
+            "create_commit",
+            json.dumps({"branch": "fix/issue-1", "commit_sha": "c0ffee123456"}),
+            commit_calls,
+        ),
+    ]
+    graph = create_agent_graph(
+        model=FakeModel(MODEL_JSON, DESIGN_JSON), tools=tools, token="ght_test"
+    )
+    final = await graph.ainvoke(dict(ISSUE_INPUT))
+    assert final["applied_branch"] == "fix/issue-1"
+    assert [event.kind for event in final["events"]] == [
+        "target",
+        "context",
+        "hypothesis",
+        "design",
+        "branch",
+        "commit",
+        "pr",
+    ]
+    assert branch_calls[0] == {
+        "tool": "create_branch",
+        "owner": "octocat",
+        "name": "Hello-World",
+        "base_branch": "main",
+        "new_branch": "fix/issue-1",
+    }
+    assert commit_calls[0]["branch"] == "fix/issue-1"
+    assert commit_calls[0]["message"].startswith("AgentOS: fix issue #1")
+    assert commit_calls[0]["changes"] == [
+        {
+            "path": "entrypoint.py",
+            "content": 'def main():\n    args = sys.argv[1:] or ["default"]\n',
+            "delete": False,
+        },
+        {"path": "legacy.py", "content": "", "delete": True},
+    ]
+
+
+async def test_full_run_uses_custom_base_branch() -> None:
+    branch_calls: list[dict[str, Any]] = []
+    tools = [
+        *PLAIN_TOOLS,
+        make_tool("create_branch", json.dumps({"sha": "ABC123"}), branch_calls),
+        make_tool("create_commit", json.dumps({"commit_sha": "c0ffee123456"})),
+    ]
+    graph = create_agent_graph(
+        model=FakeModel(MODEL_JSON, DESIGN_JSON),
+        tools=tools,
+        token="ght_test",
+    )
+    target = RunTarget(
+        repo_full_name="octocat/Hello-World", kind="issue", number=9, base_branch="trunk"
+    )
+    final = await graph.ainvoke(dict(ISSUE_INPUT, target=target))
+    assert final["applied_branch"] == "fix/issue-9"
+    assert branch_calls[0]["base_branch"] == "trunk"
+
+
+async def test_apply_without_token_stops_before_pr() -> None:
+    graph = create_agent_graph(
+        model=FakeModel(MODEL_JSON, DESIGN_JSON), tools=PLAIN_TOOLS, token=None
+    )
+    final = await graph.ainvoke(dict(ISSUE_INPUT))
+    assert final["applied_branch"] is None
+    assert final["events"][-1].stage == "apply"
+    assert [event.kind for event in final["events"]] == [
+        "target",
+        "context",
+        "hypothesis",
+        "design",
+        "error",
+    ]
+    assert final["events"][-1].detail.startswith("GITHUB_TOKEN required")
+
+
+async def test_apply_mcp_error_stops_run() -> None:
+    tools = [
+        *PLAIN_TOOLS,
+        make_tool("create_branch", ToolException("boom")),
+        make_tool("create_commit", json.dumps({"commit_sha": "c0ffee123456"})),
+    ]
+    graph = create_agent_graph(
+        model=FakeModel(MODEL_JSON, DESIGN_JSON), tools=tools, token="ght_test"
+    )
+    final = await graph.ainvoke(dict(ISSUE_INPUT))
+    assert final["applied_branch"] is None
+    assert final["events"][-1].kind == "error"
+    assert final["events"][-1].detail.startswith("apply failed")
 
 
 async def test_investigate_tool_error_falls_back_gracefully() -> None:
