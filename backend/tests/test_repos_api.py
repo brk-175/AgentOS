@@ -1,120 +1,166 @@
-"""Repository API tests: live GitHub data mapped through the user's token."""
+"""Endpoint tests for RAG: repo indexing + semantic search."""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from typing import Any
 
 import httpx
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agentos.services import github
-from tests.conftest import DbFactory, auth_cookie, seed_authenticated_user
+from agentos.api.deps import get_db
+from agentos.api.repos import get_embeddings
+from agentos.app import create_app
+from agentos.core.config import get_settings
+from agentos.services.github import RepositorySummary
+from agentos.services.rag import IndexSummary, SearchHit
+from tests.conftest import seed_authenticated_user
 
-REPOS_PATH = "/api/v1/repos"
-FETCH_PATH = "/api/v1/repos/fetch"
-
-FAKE_REPOS = [
-    github.RepositorySummary(
-        full_name="octo/repo-a",
-        private=False,
-        default_branch="main",
-        description="First repo",
-        updated_at="2026-01-02T00:00:00Z",
-        html_url="https://github.com/octo/repo-a",
-    ),
-    github.RepositorySummary(
-        full_name="octo/repo-b",
-        private=True,
-        default_branch="trunk",
-        description=None,
-        updated_at="2026-01-01T00:00:00Z",
-        html_url="https://github.com/octo/repo-b",
-    ),
-]
+API_PREFIX = get_settings().api_prefix
 
 
-async def _authed_client(client: httpx.AsyncClient, db_factory: DbFactory) -> None:
-    auth_cookie(client, await seed_authenticated_user(db_factory, github_id=31337, username="octo"))
+class _FakeEmbeddings:
+    async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [[1.0, 0.0] for _ in texts]
+
+    async def aembed_query(self, text: str) -> list[float]:
+        return [1.0, 0.0]
 
 
-async def test_list_repos_requires_auth(client: httpx.AsyncClient) -> None:
-    response = await client.get(REPOS_PATH)
+@pytest.fixture()
+async def repos_env(
+    db_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[tuple[httpx.AsyncClient, pytest.MonkeyPatch]]:
+    app = create_app()
+    app.dependency_overrides[get_embeddings] = lambda: _FakeEmbeddings()
+
+    async def override_db() -> AsyncIterator[AsyncSession]:
+        async with db_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_db
+
+    async def fake_get_repository(access_token: str, full_name: str) -> RepositorySummary:
+        if full_name == "missing/repo":
+            from agentos.services.github import GitHubClientError
+
+            raise GitHubClientError("Repository not found or inaccessible", status=404)
+        return RepositorySummary(
+            full_name=full_name,
+            private=False,
+            default_branch="main",
+            description=None,
+            updated_at="2026-01-01T00:00:00Z",
+            html_url=f"https://github.com/{full_name}",
+        )
+
+    monkeypatch.setattr("agentos.api.repos.github.get_repository", fake_get_repository)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        yield client, monkeypatch
+
+
+async def _auth_cookie(
+    client: httpx.AsyncClient, db_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    cookie = await seed_authenticated_user(db_factory, github_id=333, username="carol")
+    client.cookies.set("agentos_session", cookie)
+
+
+async def test_index_requires_auth(
+    repos_env: tuple[httpx.AsyncClient, pytest.MonkeyPatch],
+) -> None:
+    client, _ = repos_env
+    response = await client.post(f"{API_PREFIX}/repos/octocat/AgentOS/index")
     assert response.status_code == 401
 
 
-async def test_list_repos_success(
-    client: httpx.AsyncClient, db_factory: DbFactory, monkeypatch: pytest.MonkeyPatch
+async def test_index_calls_rag_and_reports_summary(
+    repos_env: tuple[httpx.AsyncClient, pytest.MonkeyPatch],
+    db_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    await _authed_client(client, db_factory)
+    client, monkeypatch = repos_env
+    await _auth_cookie(client, db_factory)
+    captured: dict[str, Any] = {}
 
-    async def fake_list(access_token: str) -> list[github.RepositorySummary]:
-        assert access_token == "gho_test_access_token"
-        return FAKE_REPOS
+    async def fake_index(db: AsyncSession, token: str, repo: str, *, embeddings: Any = None) -> Any:
+        captured["token"] = token
+        captured["repo"] = repo
+        return IndexSummary(repo_full_name=repo, files_indexed=4, chunks=12, chars=500)
 
-    monkeypatch.setattr(github, "list_repositories", fake_list)
-    response = await client.get(REPOS_PATH)
+    monkeypatch.setattr("agentos.api.repos.rag.index_repository", fake_index)
+
+    response = await client.post(f"{API_PREFIX}/repos/octocat/AgentOS/index")
     assert response.status_code == 200
-    body = response.json()
-    assert [repo["full_name"] for repo in body] == ["octo/repo-a", "octo/repo-b"]
-    assert body[1]["private"] is True
-    assert body[1]["description"] is None
-    assert body[0]["default_branch"] == "main"
+    assert response.json() == {
+        "full_name": "octocat/AgentOS",
+        "files_indexed": 4,
+        "chunks": 12,
+        "chars": 500,
+    }
+    assert captured["token"] == "gho_test_access_token"
+    assert captured["repo"] == "octocat/AgentOS"
 
 
-async def test_list_repos_token_revoked(
-    client: httpx.AsyncClient, db_factory: DbFactory, monkeypatch: pytest.MonkeyPatch
+async def test_index_missing_repo_maps_to_404(
+    repos_env: tuple[httpx.AsyncClient, pytest.MonkeyPatch],
+    db_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    await _authed_client(client, db_factory)
-
-    async def fake_list(access_token: str) -> list[github.RepositorySummary]:
-        raise github.GitHubClientError("GitHub token is invalid or revoked", status=401)
-
-    monkeypatch.setattr(github, "list_repositories", fake_list)
-    response = await client.get(REPOS_PATH)
-    assert response.status_code == 401
-    assert "reconnect" in response.json()["detail"].lower()
-
-
-async def test_list_repos_rate_limited(
-    client: httpx.AsyncClient, db_factory: DbFactory, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    await _authed_client(client, db_factory)
-
-    async def fake_list(access_token: str) -> list[github.RepositorySummary]:
-        raise github.GitHubClientError("rate limit", status=403)
-
-    monkeypatch.setattr(github, "list_repositories", fake_list)
-    response = await client.get(REPOS_PATH)
-    assert response.status_code == 429
-
-
-async def test_fetch_repo_success(
-    client: httpx.AsyncClient, db_factory: DbFactory, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    await _authed_client(client, db_factory)
-
-    async def fake_get(access_token: str, full_name: str) -> github.RepositorySummary:
-        assert full_name == "octo/repo-a"
-        return FAKE_REPOS[0]
-
-    monkeypatch.setattr(github, "get_repository", fake_get)
-    response = await client.get(f"{FETCH_PATH}?full_name=octo/repo-a")
-    assert response.status_code == 200
-    assert response.json()["full_name"] == "octo/repo-a"
-
-
-async def test_fetch_repo_not_found(
-    client: httpx.AsyncClient, db_factory: DbFactory, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    await _authed_client(client, db_factory)
-
-    async def fake_get(access_token: str, full_name: str) -> github.RepositorySummary:
-        raise github.GitHubClientError("Repository not found or inaccessible", status=404)
-
-    monkeypatch.setattr(github, "get_repository", fake_get)
-    response = await client.get(f"{FETCH_PATH}?full_name=octo/ghost")
+    client, _ = repos_env
+    await _auth_cookie(client, db_factory)
+    response = await client.post(f"{API_PREFIX}/repos/missing/repo/index")
     assert response.status_code == 404
 
 
-async def test_fetch_repo_requires_full_name(
-    client: httpx.AsyncClient, db_factory: DbFactory
+async def test_index_rag_failure_maps_to_502(
+    repos_env: tuple[httpx.AsyncClient, pytest.MonkeyPatch],
+    db_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    await _authed_client(client, db_factory)
-    response = await client.get(FETCH_PATH)
+    client, monkeypatch = repos_env
+    await _auth_cookie(client, db_factory)
+
+    async def broken_index(
+        db: AsyncSession, token: str, repo: str, *, embeddings: Any = None
+    ) -> Any:
+        raise RuntimeError("MCP server died")
+
+    monkeypatch.setattr("agentos.api.repos.rag.index_repository", broken_index)
+
+    response = await client.post(f"{API_PREFIX}/repos/octocat/AgentOS/index")
+    assert response.status_code == 502
+
+
+async def test_search_returns_ranked_hits(
+    repos_env: tuple[httpx.AsyncClient, pytest.MonkeyPatch],
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    client, monkeypatch = repos_env
+    await _auth_cookie(client, db_factory)
+
+    async def fake_search(
+        db: AsyncSession, repo: str, query: str, *, embeddings: Any = None, **_: Any
+    ) -> list[SearchHit]:
+        return [SearchHit(path="src/crash.py", chunk_index=0, content="null bug", score=0.9215)]
+
+    monkeypatch.setattr("agentos.api.repos.rag.search_repository", fake_search)
+
+    response = await client.get(f"{API_PREFIX}/repos/octocat/AgentOS/search", params={"q": "crash"})
+    assert response.status_code == 200
+    assert response.json() == {
+        "query": "crash",
+        "hits": [
+            {"path": "src/crash.py", "chunk_index": 0, "content": "null bug", "score": 0.9215}
+        ],
+    }
+
+
+async def test_search_validates_query_length(
+    repos_env: tuple[httpx.AsyncClient, pytest.MonkeyPatch],
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    client, _ = repos_env
+    await _auth_cookie(client, db_factory)
+    response = await client.get(f"{API_PREFIX}/repos/octocat/AgentOS/search", params={"q": "x"})
     assert response.status_code == 422
