@@ -8,7 +8,7 @@ from typing import Any
 from langchain_core.messages import AIMessage
 from langchain_core.tools import StructuredTool, ToolException
 
-from agentos.agent.state import RunTarget
+from agentos.agent.state import ContextDoc, RunTarget
 from agentos.tasks import celery_app, execute_run
 
 TARGET = RunTarget(repo_full_name="octocat/Hello-World", kind="issue", number=1)
@@ -120,6 +120,50 @@ async def test_execute_run_surfaces_apply_failure() -> None:
     assert error["detail"].startswith("apply failed")
     assert published[-1]["type"] == "final"
     assert published[-1]["state"]["applied_branch"] is None
+
+
+async def test_execute_run_with_retrieval_publishes_rag_event() -> None:
+    published: list[dict[str, Any]] = []
+
+    async def publish(payload: dict[str, Any]) -> None:
+        published.append(payload)
+
+    async def fake_retrieve(repo: str, query: str, top_k: int) -> list[ContextDoc]:
+        return [
+            ContextDoc(
+                path="src/app.py",
+                content="def run(): return None",
+                chunk_index=3,
+                score=0.9,
+            )
+        ]
+
+    result = await execute_run(
+        "run-3",
+        TARGET,
+        "ght_test",
+        publish=publish,
+        model=FakeModel(MODEL_JSON, DESIGN_JSON, PR_SUMMARY_JSON),
+        tools=FULL_TOOLS,
+        retrieval=fake_retrieve,
+    )
+    kinds = [item["kind"] for item in published if item["type"] == "event"]
+    assert kinds == [
+        "target",
+        "rag",
+        "context",
+        "hypothesis",
+        "design",
+        "branch",
+        "commit",
+        "summary",
+        "pr",
+    ]
+    rag_event = next(
+        item for item in published if item["type"] == "event" and item["kind"] == "rag"
+    )
+    assert rag_event["detail"] == "retrieved 1 relevant chunk(s)"
+    assert result["pr_url"] == "https://github.com/octocat/Hello-World/pull/42"
 
 
 def test_celery_app_is_wired_to_settings() -> None:

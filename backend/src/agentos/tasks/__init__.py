@@ -22,8 +22,10 @@ from langchain_core.tools import BaseTool
 
 from agentos.agent.graph import create_agent_graph, create_agent_llm
 from agentos.agent.mcp_adapter import GitHubMCPTools
-from agentos.agent.state import RunTarget
+from agentos.agent.state import Retriever, RunTarget
 from agentos.core.config import get_settings
+from agentos.db.session import build_engine
+from agentos.services.rag import build_retriever
 from agentos.services.run_bus import RunStore
 
 logger = logging.getLogger(__name__)
@@ -60,11 +62,13 @@ async def execute_run(
     publish: Callable[[dict[str, Any]], Awaitable[None]],
     model: Any = None,
     tools: Sequence[BaseTool] | None = None,
+    retrieval: Retriever | None = None,
 ) -> dict[str, Any]:
     """Run the fix-agent pipeline, publishing each fresh event as it happens.
 
-    ``model``/``tools`` are injectable for tests; by default the task boots the
-    real OpenRouter model and the GitHub MCP server with the user's token.
+    ``model``/``tools``/``retrieval`` are injectable for tests; by default the
+    task boots the real OpenRouter model and the GitHub MCP server with the
+    user's token.
     """
     initial = {
         "target": target,
@@ -78,6 +82,7 @@ async def execute_run(
             model=model if model is not None else create_agent_llm(),
             tools=stream_tools,
             token=access_token,
+            retrieval=retrieval,
         )
         final: dict[str, Any] = {}
         seen_events = 0
@@ -132,12 +137,19 @@ def run_fix_workflow(
         async def publish(payload: dict[str, Any]) -> None:
             await store.append_event(run_id, payload)
 
+        engine = None
         try:
+            if access_token:
+                engine = build_engine(settings)
+                retrieval = build_retriever(engine)
+            else:
+                retrieval = None
             result = await execute_run(
                 run_id,
                 RunTarget.model_validate(target),
                 access_token,
                 publish=publish,
+                retrieval=retrieval,
             )
             await store.set_final(run_id, {"status": "completed", "state": result}, user_id=user_id)
             return result
@@ -156,6 +168,8 @@ def run_fix_workflow(
             await store.set_final(run_id, failed, user_id=user_id)
             return failed
         finally:
+            if engine is not None:
+                await engine.dispose()
             await redis.aclose()
 
     return asyncio.run(_inner())

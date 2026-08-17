@@ -7,13 +7,13 @@ from typing import Any
 
 import pytest
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import StructuredTool, ToolException
 from langchain_openai import ChatOpenAI
 
 from agentos.agent.graph import create_agent_graph, create_agent_llm
 from agentos.agent.mcp_adapter import GitHubMCPTools, json_schema_to_model
-from agentos.agent.state import FileChange, RunTarget
+from agentos.agent.state import ContextDoc, FileChange, RunTarget
 
 ISSUE_INPUT: dict[str, Any] = {
     "target": RunTarget(repo_full_name="octocat/Hello-World", kind="issue", number=1),
@@ -109,8 +109,10 @@ class FakeModel:
     def __init__(self, *contents: str) -> None:
         self._contents = contents or ("{}",)
         self._index = 0
+        self.calls: list[list[Any]] = []
 
     async def ainvoke(self, messages: list[Any]) -> AIMessage:
+        self.calls.append(messages)
         content = self._contents[min(self._index, len(self._contents) - 1)]
         self._index += 1
         return AIMessage(content=content)
@@ -185,6 +187,85 @@ async def test_investigate_uses_tools_and_model() -> None:
     ]
     assert final["events"][0].detail.startswith("issue #1 loaded")
     assert final["events"][1].detail == "read 1 file(s)"
+
+
+async def test_investigate_uses_rag_retrieval_context() -> None:
+    calls: list[tuple[str, str, int]] = []
+
+    async def fake_retrieve(repo: str, query: str, top_k: int) -> list[ContextDoc]:
+        calls.append((repo, query, top_k))
+        return [
+            ContextDoc(
+                path="src/app.py",
+                content="def run():\n    return None  # null crash",
+                chunk_index=3,
+                score=0.91,
+            ),
+            ContextDoc(
+                path="src/app.py", content="args = sys.argv or []", chunk_index=4, score=0.87
+            ),
+        ]
+
+    model = FakeModel(MODEL_JSON, "garbage")
+    graph = create_agent_graph(model=model, tools=PLAIN_TOOLS, retrieval=fake_retrieve)
+    final = await graph.ainvoke(dict(ISSUE_INPUT))
+    assert calls == [("octocat/Hello-World", "issue #1 in octocat/Hello-World", 4)]
+    rag_event = next(e for e in final["events"] if e.kind == "rag")
+    assert rag_event.detail == "retrieved 2 relevant chunk(s)"
+    prompt = next(m for m in model.calls[0] if isinstance(m, HumanMessage)).content
+    assert "def run():" in prompt
+    assert "[chunk 3, relevance 0.91]" in prompt
+    assert len(final["context"]) == 3
+    assert final["context"][0].path == "src/app.py"
+    assert final["context"][0].score == 0.91
+    assert final["context"][1].chunk_index == 4
+    assert [event.kind for event in final["events"]] == [
+        "target",
+        "rag",
+        "context",
+        "hypothesis",
+        "error",
+        "error",
+    ]
+
+
+async def test_investigate_uses_target_title_as_retrieval_query() -> None:
+    queries: list[str] = []
+
+    async def fake_retrieve(repo: str, query: str, top_k: int) -> list[ContextDoc]:
+        queries.append(query)
+        return []
+
+    target = RunTarget(
+        repo_full_name="octocat/Hello-World",
+        kind="issue",
+        number=7,
+        title="App crashes on empty input",
+    )
+    graph = create_agent_graph(
+        model=FakeModel(MODEL_JSON, "garbage"), tools=PLAIN_TOOLS, retrieval=fake_retrieve
+    )
+    final = await graph.ainvoke(dict(ISSUE_INPUT, target=target))
+    assert queries == ["App crashes on empty input"]
+    assert final["investigation"] == "App crashes when run without arguments."
+    rag_event = next(e for e in final["events"] if e.kind == "rag")
+    assert rag_event.detail == "no relevant chunks found"
+
+
+async def test_investigate_degrades_when_retrieval_fails() -> None:
+    async def broken_retrieve(repo: str, query: str, top_k: int) -> list[ContextDoc]:
+        raise RuntimeError("db down")
+
+    model = FakeModel(MODEL_JSON, "garbage")
+    graph = create_agent_graph(model=model, tools=PLAIN_TOOLS, retrieval=broken_retrieve)
+    final = await graph.ainvoke(dict(ISSUE_INPUT))
+    assert final["investigation"] == "App crashes when run without arguments."
+    assert final["root_cause_hypothesis"] == "missing null check in the entrypoint"
+    rag_event = next(e for e in final["events"] if e.kind == "rag")
+    assert rag_event.detail == "retrieval failed: db down"
+    prompt = next(m for m in model.calls[0] if isinstance(m, HumanMessage)).content
+    assert "def run():" not in prompt
+    assert "### README.md" in prompt
 
 
 async def test_design_produces_structured_changes() -> None:

@@ -10,7 +10,12 @@ from collections.abc import AsyncIterator
 
 import httpx
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.pool import StaticPool
 
 from agentos.app import create_app
@@ -25,7 +30,7 @@ DbFactory = async_sessionmaker[AsyncSession]
 
 
 @pytest.fixture()
-async def db_factory() -> AsyncIterator[DbFactory]:
+async def db_engine() -> AsyncIterator[AsyncEngine]:
     engine = create_async_engine(
         "sqlite+aiosqlite://",
         connect_args={"check_same_thread": False},
@@ -33,11 +38,15 @@ async def db_factory() -> AsyncIterator[DbFactory]:
     )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
-        yield factory
+        yield engine
     finally:
         await engine.dispose()
+
+
+@pytest.fixture()
+async def db_factory(db_engine: AsyncEngine) -> AsyncIterator[DbFactory]:
+    yield async_sessionmaker(db_engine, expire_on_commit=False)
 
 
 @pytest.fixture()

@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-
 import pytest
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from agentos.models.base import Base
 from agentos.models.repository_document import RepositoryDocument
-from agentos.services.rag import ContentFile, index_repository, search_repository
+from agentos.services.rag import (
+    ContentFile,
+    build_retriever,
+    index_repository,
+    search_repository,
+)
 
 DIMENSIONS = 1536
 
@@ -39,22 +40,6 @@ class FakeEmbeddings:
     @staticmethod
     def _pad(vector: list[float]) -> list[float]:
         return vector + [0.0] * (DIMENSIONS - len(vector))
-
-
-@pytest.fixture()
-async def db_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    engine = create_async_engine(
-        "sqlite+aiosqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    try:
-        yield factory
-    finally:
-        await engine.dispose()
 
 
 async def _count_documents(session: AsyncSession, repo: str) -> int:
@@ -160,3 +145,27 @@ async def test_search_on_empty_index_returns_nothing(
             session, "octocat/demo", "anything", embeddings=FakeEmbeddings()
         )
     assert hits == []
+
+
+async def test_build_retriever_maps_hits_to_context_docs(
+    db_engine: AsyncEngine,
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with db_factory() as session:
+        await index_repository(
+            session,
+            "tok",
+            "octocat/demo",
+            embeddings=FakeEmbeddings(),
+            files=[
+                ContentFile(path="src/crash.py", content="crash on empty input null pointer bug")
+            ],
+        )
+    retrieve = build_retriever(db_engine, embeddings=FakeEmbeddings())
+    docs = await retrieve("octocat/demo", "crash null")
+    assert len(docs) == 1
+    assert docs[0].path == "src/crash.py"
+    assert docs[0].content == "crash on empty input null pointer bug"
+    assert docs[0].chunk_index == 0
+    assert docs[0].score == pytest.approx(1.0)
+    assert await retrieve("octocat/demo", "zzz nothing indexed") == []

@@ -17,10 +17,12 @@ from math import sqrt
 from typing import Any
 
 from sqlalchemy import delete, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from agentos.agent.mcp_adapter import GitHubMCPTools
+from agentos.agent.state import ContextDoc, Retriever
 from agentos.core.logging import get_logger
+from agentos.db.session import build_session_factory
 from agentos.models.repository_document import RepositoryDocument
 from agentos.services.embeddings import chunk_text, create_embeddings_client
 
@@ -201,3 +203,38 @@ async def search_repository(
         if len(hits) == top_k:
             break
     return hits
+
+
+def build_retriever(
+    engine: AsyncEngine,
+    *,
+    top_k: int = 5,  # matches the agent's MAX_RAG_CONTEXT
+    threshold: float = 0.25,
+    embeddings: Any | None = None,
+) -> Retriever:
+    """Bind the RAG store to the agent's retrieval interface.
+
+    The returned callable performs a semantic search on ``repo_full_name``
+    and maps the hits onto ``ContextDoc`` entries (path, content, chunk,
+    score) that ``investigate`` merges into the agent context.
+    """
+    factory = build_session_factory(engine)
+
+    async def retrieve(repo_full_name: str, query: str, limit: int = top_k) -> list[ContextDoc]:
+        async with factory() as session:
+            hits = await search_repository(
+                session,
+                repo_full_name,
+                query,
+                embeddings=embeddings,
+                top_k=limit,
+                threshold=threshold,
+            )
+        return [
+            ContextDoc(
+                path=hit.path, content=hit.content, chunk_index=hit.chunk_index, score=hit.score
+            )
+            for hit in hits
+        ]
+
+    return retrieve

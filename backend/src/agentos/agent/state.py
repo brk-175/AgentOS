@@ -9,6 +9,7 @@ events will feed the SSE stream and the audit log in later stages.
 from __future__ import annotations
 
 import operator
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Annotated, Literal, TypedDict
 
@@ -43,10 +44,19 @@ class FileChange(BaseModel):
 
 
 class ContextDoc(BaseModel):
-    """A repository file the investigate node gathered for the design stage."""
+    """A repository file/chunk the investigate node gathered for the agent.
+
+    ``chunk_index``/``score`` are set when the doc comes from RAG retrieval
+    (pgvector chunks); plain file reads leave them at their defaults.
+    """
 
     path: str
     content: str
+    chunk_index: int = 0
+    score: float | None = None
+
+
+Retriever = Callable[[str, str, int], Awaitable[list[ContextDoc]]]
 
 
 class RunEvent(BaseModel):

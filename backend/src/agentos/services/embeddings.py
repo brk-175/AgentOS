@@ -27,7 +27,9 @@ def create_embeddings_client() -> OpenAIEmbeddings:
     )
 
 
-def chunk_text(text: str, *, chunk_size: int = DEFAULT_CHUNK_SIZE, overlap: int = DEFAULT_CHUNK_OVERLAP) -> list[str]:
+def chunk_text(
+    text: str, *, chunk_size: int = DEFAULT_CHUNK_SIZE, overlap: int = DEFAULT_CHUNK_OVERLAP
+) -> list[str]:
     """Split ``text`` into overlapping chunks by character count.
 
     Chunks are trimmed of leading/trailing whitespace; empty text yields no

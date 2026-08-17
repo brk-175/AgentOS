@@ -24,12 +24,13 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import SecretStr
 
-from agentos.agent.state import AgentState, ContextDoc, FileChange, RunEvent
+from agentos.agent.state import AgentState, ContextDoc, FileChange, Retriever, RunEvent
 from agentos.core.config import get_settings
 
 MAX_CONTEXT_FILES = 2
 MAX_FILE_CHARS = 3000
 MAX_PROMPT_CONTEXT = 12_000
+MAX_RAG_CONTEXT = 5
 _INVESTIGATE_PROMPT = """You are the investigation stage of a GitHub code-fix agent.
 You receive an issue/PR and some repository context. Determine what the problem
 is and where it likely comes from.
@@ -141,11 +142,31 @@ async def _gather_context(
     return docs, len(picked)
 
 
+async def _retrieve_context(
+    retrieval: Retriever, state: AgentState
+) -> tuple[list[ContextDoc], str]:
+    """Semantic chunk search for the issue; never raises (degrade on failure)."""
+    target = state["target"]
+    query = target.title or f"{target.kind} #{target.number} in {target.repo_full_name}"
+    docs = await retrieval(target.repo_full_name, query, MAX_RAG_CONTEXT)
+    if not docs:
+        return [], "no relevant chunks found"
+    return docs, f"retrieved {len(docs)} relevant chunk(s)"
+
+
+def _context_part(doc: ContextDoc) -> str:
+    """Render one context doc as a prompt block (RAG docs carry provenance)."""
+    if doc.score is None:
+        return f"### {doc.path}\n{doc.content}"
+    return f"### {doc.path} [chunk {doc.chunk_index}, relevance {doc.score:.2f}]\n{doc.content}"
+
+
 async def investigate_node(
     state: AgentState,
     *,
     model: BaseChatModel | None,
     tools: Sequence[BaseTool],
+    retrieval: Retriever | None = None,
 ) -> dict[str, Any]:
     """Investigate the target: load it via MCP, gather context, LLM analysis."""
     target = state["target"]
@@ -187,6 +208,21 @@ async def investigate_node(
             "events": events,
         }
 
+    if retrieval is not None:
+        try:
+            docs, detail = await _retrieve_context(retrieval, state)
+        except Exception as exc:
+            events.append(
+                RunEvent(stage="investigate", kind="rag", detail=f"retrieval failed: {exc}")
+            )
+        else:
+            events.append(
+                RunEvent(
+                    stage="investigate", kind="rag", detail=detail or "no relevant chunks found"
+                )
+            )
+            context_docs.extend(docs)
+
     try:
         context, files_read = await _gather_context(tools, state)
     except Exception as exc:
@@ -198,13 +234,14 @@ async def investigate_node(
             RunEvent(stage="investigate", kind="context", detail=f"read {files_read} file(s)")
         )
     context_docs.extend(context)
-    context_parts.extend(f"### {doc.path}\n{doc.content}" for doc in context_docs)
+    context_parts.extend(_context_part(doc) for doc in context_docs)
 
     if model is None:
         return {
             "investigation": f"{target.kind} #{target.number} loaded from {target.repo_full_name}"
             + (f": {details.get('title', '')}" if details.get("title") else ""),
             "root_cause_hypothesis": "",
+            "context": context_docs,
             "events": events,
         }
 
@@ -227,6 +264,7 @@ async def investigate_node(
             "investigation": f"Analyzed {target.kind} #{target.number} of {target.repo_full_name}"
             + f": {details.get('title', '').strip()}",
             "root_cause_hypothesis": "",
+            "context": context_docs,
             "events": events,
         }
     events.append(
@@ -235,6 +273,7 @@ async def investigate_node(
     return {
         "investigation": investigation,
         "root_cause_hypothesis": hypothesis,
+        "context": context_docs,
         "events": events,
     }
 
@@ -478,13 +517,15 @@ async def pr_node(
 
 
 def _investigate_with(
-    model: BaseChatModel | None, tools: Sequence[BaseTool]
+    model: BaseChatModel | None,
+    tools: Sequence[BaseTool],
+    retrieval: Retriever | None = None,
 ) -> Callable[[AgentState], Awaitable[dict[str, Any]]]:
     """Closure binding model+tools into the investigate node (LangGraph needs
     a real async callable — a sync wrapper returning a coroutine is not awaited)."""
 
     async def node(state: AgentState) -> dict[str, Any]:
-        return await investigate_node(state, model=model, tools=tools)
+        return await investigate_node(state, model=model, tools=tools, retrieval=retrieval)
 
     return node
 
@@ -536,17 +577,20 @@ def create_agent_graph(
     model: BaseChatModel | None = None,
     tools: Sequence[BaseTool] = (),
     token: str | None = None,
+    retrieval: Retriever | None = None,
 ) -> CompiledStateGraph:
     """Build and compile the fix-agent pipeline.
 
     ``model`` and ``tools`` are bound into the investigate node, ``tools`` +
     ``token`` into apply and the model/tools/token into the PR node. Without
     model/tools/token the graph runs in deterministic stub mode (useful for
-    tests/demo).
+    tests/demo). ``retrieval`` — when provided — is queried during
+    ``investigate`` for semantically relevant chunks; failures degrade
+    silently into today's file-only context.
     """
     pass_through = model is None and not tools and token is None
     builder = StateGraph(AgentState)
-    builder.add_node("investigate", cast(Any, _investigate_with(model, tools)))
+    builder.add_node("investigate", cast(Any, _investigate_with(model, tools, retrieval)))
     builder.add_node("design", cast(Any, _design_with(model)))
     builder.add_node("apply", cast(Any, _apply_with(tools, token)))
     builder.add_node("pr", cast(Any, _pr_with(model, tools, token)))
