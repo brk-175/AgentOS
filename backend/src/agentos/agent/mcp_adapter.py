@@ -8,6 +8,8 @@ call GitHub with typed arguments. Deliberately replaces
 
 from __future__ import annotations
 
+import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -19,14 +21,27 @@ from pydantic import BaseModel, create_model
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _DEFAULT_EXE = _REPO_ROOT / "mcp-servers" / ".venv" / "Scripts" / "github-mcp-server.exe"
+_MCP_SERVER_SCRIPT = "github-mcp-server"
 
 
 def default_github_mcp_command() -> tuple[str, list[str]]:
-    """Return ``(command, args)`` that launch the project's GitHub MCP server."""
+    """Return ``(command, args)`` that launch the project's GitHub MCP server.
+
+    Resolution order: ``GITHUB_MCP_COMMAND`` env override (container
+    deployment) → ``github-mcp-server`` console script on PATH (installed
+    package) → the repo's local Windows dev build.
+    """
+    override = os.environ.get("GITHUB_MCP_COMMAND")
+    if override:
+        return (override, [])
+    on_path = shutil.which(_MCP_SERVER_SCRIPT)
+    if on_path:
+        return (on_path, [])
     if _DEFAULT_EXE.exists():
         return (str(_DEFAULT_EXE), [])
     raise FileNotFoundError(
-        f"github-mcp-server executable not found at {_DEFAULT_EXE} — pass command/args explicitly"
+        f"github-mcp-server executable not found — set GITHUB_MCP_COMMAND, add it "
+        f"to PATH, or build it at {_DEFAULT_EXE}"
     )
 
 

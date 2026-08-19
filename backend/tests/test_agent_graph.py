@@ -12,7 +12,11 @@ from langchain_core.tools import StructuredTool, ToolException
 from langchain_openai import ChatOpenAI
 
 from agentos.agent.graph import create_agent_graph, create_agent_llm
-from agentos.agent.mcp_adapter import GitHubMCPTools, json_schema_to_model
+from agentos.agent.mcp_adapter import (
+    GitHubMCPTools,
+    default_github_mcp_command,
+    json_schema_to_model,
+)
 from agentos.agent.state import ContextDoc, FileChange, RunTarget
 
 ISSUE_INPUT: dict[str, Any] = {
@@ -189,6 +193,25 @@ async def test_investigate_uses_tools_and_model() -> None:
     assert final["events"][1].detail == "read 1 file(s)"
 
 
+def test_default_github_mcp_command_prefers_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB_MCP_COMMAND", "/usr/bin/gh-mcp")
+    command, args = default_github_mcp_command()
+    assert command == "/usr/bin/gh-mcp"
+    assert args == []
+
+
+def test_default_github_mcp_command_falls_back_to_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GITHUB_MCP_COMMAND", raising=False)
+
+    def fake_which(name: str) -> str | None:
+        return "/opt/bin/github-mcp-server" if name == "github-mcp-server" else None
+
+    monkeypatch.setattr("agentos.agent.mcp_adapter.shutil.which", fake_which)
+    command, args = default_github_mcp_command()
+    assert command == "/opt/bin/github-mcp-server"
+    assert args == []
+
+
 async def test_investigate_uses_rag_retrieval_context() -> None:
     calls: list[tuple[str, str, int]] = []
 
@@ -209,7 +232,7 @@ async def test_investigate_uses_rag_retrieval_context() -> None:
     model = FakeModel(MODEL_JSON, "garbage")
     graph = create_agent_graph(model=model, tools=PLAIN_TOOLS, retrieval=fake_retrieve)
     final = await graph.ainvoke(dict(ISSUE_INPUT))
-    assert calls == [("octocat/Hello-World", "issue #1 in octocat/Hello-World", 4)]
+    assert calls == [("octocat/Hello-World", "issue #1 in octocat/Hello-World", 5)]
     rag_event = next(e for e in final["events"] if e.kind == "rag")
     assert rag_event.detail == "retrieved 2 relevant chunk(s)"
     prompt = next(m for m in model.calls[0] if isinstance(m, HumanMessage)).content
