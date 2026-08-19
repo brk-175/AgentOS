@@ -72,12 +72,13 @@ def _require_token() -> None:
 
 
 @mcp.tool()
-async def list_repo_files(owner: str, name: str, path: str = "") -> list[dict]:
+async def list_repo_files(owner: str, name: str, path: str = "") -> dict[str, Any]:
     """List the files and directories at ``path`` in the ``owner/name`` repository.
 
-    Returns one entry per item with ``kind`` (file/dir), ``name``, ``path``
-    and ``size`` (bytes; 0 for directories). Pass a subdirectory in ``path``
-    to navigate deeper, or omit it to start at the repository root.
+    Returns ``{"kind": "listing", "items": [...]}`` with one entry per item —
+    ``kind`` (file/dir), ``name``, ``path`` and ``size`` (bytes; 0 for
+    directories). The dict wrapper is required: the MCP SDK flattens list
+    returns into one text block per element, which corrupts the JSON payload.
     """
     url = f"{GITHUB_API_URL}/repos/{owner}/{name}/contents/{quote(path, safe='/')}".rstrip("/")
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
@@ -85,15 +86,18 @@ async def list_repo_files(owner: str, name: str, path: str = "") -> list[dict]:
     payload = _json_or_raise(response)
     if isinstance(payload, dict):
         payload = [payload]
-    return [
-        {
-            "kind": entry["type"],
-            "name": entry["name"],
-            "path": entry["path"],
-            "size": entry.get("size", 0),
-        }
-        for entry in payload
-    ]
+    return {
+        "kind": "listing",
+        "items": [
+            {
+                "kind": entry["type"],
+                "name": entry["name"],
+                "path": entry["path"],
+                "size": entry.get("size", 0),
+            }
+            for entry in payload
+        ],
+    }
 
 
 @mcp.tool()

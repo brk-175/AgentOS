@@ -84,8 +84,9 @@ async def _fetch_repo_files(
             listing = json.loads(
                 await listing_tool.ainvoke({"owner": owner, "name": repo, "path": path})
             )
+            entries = listing["items"] if isinstance(listing, dict) else listing
             paths: list[str] = []
-            for entry in listing:
+            for entry in entries:
                 kind = entry.get("kind")
                 if kind == "dir" and depth > 0:
                     paths.extend(await walk(entry["path"], depth - 1))

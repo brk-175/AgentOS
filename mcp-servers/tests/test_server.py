@@ -35,11 +35,14 @@ async def test_list_repo_files_directory(monkeypatch: pytest.MonkeyPatch) -> Non
         )
 
     _mock_client(monkeypatch, handler)
-    entries = await server.list_repo_files("octo", "repo", "src")
-    assert entries == [
-        {"kind": "dir", "name": "agentos", "path": "src/agentos", "size": 0},
-        {"kind": "file", "name": "main.py", "path": "src/main.py", "size": 1200},
-    ]
+    result = await server.list_repo_files("octo", "repo", "src")
+    assert result == {
+        "kind": "listing",
+        "items": [
+            {"kind": "dir", "name": "agentos", "path": "src/agentos", "size": 0},
+            {"kind": "file", "name": "main.py", "path": "src/main.py", "size": 1200},
+        ],
+    }
 
 
 async def test_list_repo_files_root(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -48,7 +51,7 @@ async def test_list_repo_files_root(monkeypatch: pytest.MonkeyPatch) -> None:
         return httpx.Response(200, json=[])
 
     _mock_client(monkeypatch, handler)
-    assert await server.list_repo_files("octo", "repo") == []
+    assert await server.list_repo_files("octo", "repo") == {"kind": "listing", "items": []}
 
 
 async def test_list_repo_files_single_file_returns_one_entry(
@@ -61,7 +64,7 @@ async def test_list_repo_files_single_file_returns_one_entry(
         )
 
     _mock_client(monkeypatch, handler)
-    entries = await server.list_repo_files("octo", "repo", "README.md")
+    entries = (await server.list_repo_files("octo", "repo", "README.md"))["items"]
     assert len(entries) == 1
     assert entries[0]["kind"] == "file"
 

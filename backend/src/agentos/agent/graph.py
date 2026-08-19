@@ -129,10 +129,10 @@ async def _gather_context(
     if listing_tool is None or read_tool is None:
         return [], 0
     listing = json.loads(await listing_tool.ainvoke({"owner": owner, "name": repo, "path": ""}))
-    entries = sorted(listing, key=lambda e: not bool(_PATCHABLE_NAME.match(e["name"])))
+    entries = listing["items"] if isinstance(listing, dict) else listing
     picked = [
         entry["path"]
-        for entry in entries
+        for entry in sorted(entries, key=lambda e: not bool(_PATCHABLE_NAME.match(e["name"])))
         if entry.get("kind") == "file" and entry.get("size", 0) <= MAX_FILE_CHARS
     ][:MAX_CONTEXT_FILES]
     docs: list[ContextDoc] = []

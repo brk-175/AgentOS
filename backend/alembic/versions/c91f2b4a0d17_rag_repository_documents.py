@@ -1,7 +1,7 @@
 """rag: repository_documents (embedding chunks per indexed file)
 
 Revision ID: c91f2b4a0d17
-Revises: bb97a7ad9d2d
+Revises: 231baea5963e
 Create Date: 2026-08-15 22:10:00.000000
 
 """
@@ -15,7 +15,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "c91f2b4a0d17"
-down_revision: str | None = "bb97a7ad9d2d"
+down_revision: str | None = "231baea5963e"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
