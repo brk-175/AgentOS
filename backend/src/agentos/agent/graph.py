@@ -27,10 +27,10 @@ from pydantic import SecretStr
 from agentos.agent.state import AgentState, ContextDoc, FileChange, Retriever, RunEvent
 from agentos.core.config import get_settings
 
-MAX_CONTEXT_FILES = 2
-MAX_FILE_CHARS = 3000
-MAX_PROMPT_CONTEXT = 12_000
-MAX_RAG_CONTEXT = 5
+MAX_CONTEXT_FILES = 50
+MAX_FILE_CHARS = 10_000
+MAX_PROMPT_CONTEXT = 1_00_000
+MAX_RAG_CONTEXT = 50
 _INVESTIGATE_PROMPT = """You are the investigation stage of a GitHub code-fix agent.
 You receive an issue/PR and some repository context. Determine what the problem
 is and where it likely comes from.

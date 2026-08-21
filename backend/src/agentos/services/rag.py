@@ -30,7 +30,7 @@ logger = get_logger(__name__)
 
 MAX_INDEX_FILES = 100
 MAX_INDEX_FILE_CHARS = 10_000
-MAX_DEPTH = 1  # depth 0 = repo root; each index adds one level
+MAX_DEPTH = 10  # depth 0 = repo root; each index adds one level
 
 
 @dataclass(frozen=True)
