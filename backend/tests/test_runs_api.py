@@ -184,3 +184,126 @@ async def test_run_events_404_for_unknown_run(
     client, _, _ = runs_env
     response = await client.get(f"{API_PREFIX}/runs/nope/events")
     assert response.status_code == 404
+
+
+async def test_persist_run_roundtrip(db_factory: async_sessionmaker[AsyncSession]) -> None:
+    from agentos.agent.state import RunTarget
+    from agentos.services.run_records import get_run_record, list_run_records, persist_run
+
+    target = RunTarget(
+        repo_full_name="octocat/Hello-World", kind="issue", number=1, title="Crash"
+    )
+    async with db_factory() as session:
+        await persist_run(
+            session,
+            run_id="abc123run",
+            user_id="11111111-1111-1111-1111-111111111111",
+            target=target,
+            status="completed",
+            applied_branch="fix/issue-1-1",
+            pr_url="https://pr",
+            investigation="crash",
+            hypothesis="null guard",
+            proposed_changes=[
+                {"path": "x.py", "content": "ok", "edits": [], "delete": False, "explanation": ""}
+            ],
+            evaluation={
+                "verdict": "approved",
+                "scores": {"correctness": 5.0, "minimality": 5.0, "behavior_preservation": 5.0, "grounding": 5.0},
+            },
+        )
+        row = await get_run_record(session, "abc123run")
+        assert row is not None
+        assert row["status"] == "completed"
+        assert row["pr_url"] == "https://pr"
+        assert row["evaluation"]["verdict"] == "approved"
+        assert len(await list_run_records(session, "11111111-1111-1111-1111-111111111111")) == 1
+        assert await get_run_record(session, "missing") is None
+
+
+async def test_list_runs_requires_auth(runs_env: tuple[httpx.AsyncClient, FakeRedis, list[tuple[str, Any]]]) -> None:
+    client, _, _ = runs_env
+    response = await client.get(f"{API_PREFIX}/runs")
+    assert response.status_code == 401
+
+
+async def test_get_run_falls_back_to_durable_record(
+    runs_env: tuple[httpx.AsyncClient, FakeRedis, list[tuple[str, Any]]],
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    client, _, _ = runs_env
+    cookie = await seed_authenticated_user(db_factory, github_id=333, username="carol")
+    client.cookies.set("agentos_session", cookie)
+
+    from agentos.agent.state import RunTarget
+    from agentos.services.run_records import persist_run
+
+    async with db_factory() as session:
+        await persist_run(
+            session,
+            run_id="durable-run-1",
+            user_id="33333333-3333-3333-3333-333333333333",
+            target=RunTarget(repo_full_name="octocat/Hello-World", kind="issue", number=3),
+            status="completed",
+            applied_branch="fix/issue-3-99",
+            pr_url="https://pr/9",
+            investigation="i",
+            hypothesis="h",
+            proposed_changes=[],
+            evaluation={"verdict": "changes_requested", "scores": {}},
+        )
+
+    missing = await client.get(f"{API_PREFIX}/runs/durable-run-1")
+    assert missing.status_code == 200
+    body = missing.json()
+    assert body["status"] == "completed"
+    assert body["state"]["pr_url"] == "https://pr/9"
+    assert body["state"]["evaluation"]["verdict"] == "changes_requested"
+
+
+async def test_list_runs_returns_history_for_user(
+    runs_env: tuple[httpx.AsyncClient, FakeRedis, list[tuple[str, Any]]],
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    client, _, _ = runs_env
+    cookie = await seed_authenticated_user(db_factory, github_id=444, username="dave")
+    client.cookies.set("agentos_session", cookie)
+
+    from agentos.agent.state import RunTarget
+    from agentos.services.run_records import persist_run
+
+    async with db_factory() as session:
+        user = await session.scalar(select(User).where(User.github_id == 444))
+        assert user is not None
+        await persist_run(
+            session,
+            run_id="hist-run-1",
+            user_id=user.id,
+            target=RunTarget(repo_full_name="octocat/Hello-World", kind="issue", number=1),
+            status="completed",
+            applied_branch="fix/issue-1-1",
+            pr_url=None,
+            investigation="",
+            hypothesis="",
+            proposed_changes=[],
+            evaluation=None,
+        )
+        await persist_run(
+            session,
+            run_id="hist-run-2",
+            user_id=user.id,
+            target=RunTarget(repo_full_name="octocat/Hello-World", kind="issue", number=2),
+            status="failed",
+            applied_branch=None,
+            pr_url=None,
+            investigation="",
+            hypothesis="",
+            proposed_changes=[],
+            evaluation=None,
+        )
+
+    response = await client.get(f"{API_PREFIX}/runs")
+    assert response.status_code == 200
+    rows = response.json()
+    assert [row["run_id"] for row in rows] == ["hist-run-2", "hist-run-1"]
+    assert rows[0]["status"] == "failed"

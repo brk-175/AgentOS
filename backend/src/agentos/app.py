@@ -34,6 +34,7 @@ def _build_lifespan(
             settings.redis_url,
             socket_connect_timeout=3,
             socket_timeout=3,
+            decode_responses=True,  # RunStore round-trips strings, not bytes
         )
 
         app.state.engine = engine

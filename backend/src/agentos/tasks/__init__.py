@@ -24,10 +24,11 @@ from agentos.agent.graph import create_agent_graph, create_agent_llm
 from agentos.agent.mcp_adapter import GitHubMCPTools
 from agentos.agent.state import Retriever, RunTarget
 from agentos.core.config import get_settings
-from agentos.db.session import build_engine
+from agentos.db.session import build_engine, build_session_factory
 from agentos.services.judge import create_judge_llm, evaluate_run
 from agentos.services.rag import build_retriever
 from agentos.services.run_bus import RunStore
+from agentos.services.run_records import persist_run
 
 logger = logging.getLogger(__name__)
 
@@ -214,15 +215,20 @@ def run_fix_workflow(
                 retrieval = build_retriever(engine)
             else:
                 retrieval = None
+            run_target = RunTarget.model_validate(target)
             result = await execute_run(
                 run_id,
-                RunTarget.model_validate(target),
+                run_target,
                 access_token,
                 publish=publish,
                 retrieval=retrieval,
                 judge=create_judge_llm(),
             )
             await store.set_final(run_id, {"status": "completed", "state": result}, user_id=user_id)
+            try:
+                await _persist_finished_run(engine, run_id, user_id, run_target, result)
+            except Exception:  # noqa: BLE001 - persistence is best-effort
+                logger.exception("persisting run %s failed (run itself succeeded)", run_id)
             return result
         except Exception as exc:  # noqa: BLE001 - runs must always terminate visibly
             logger.exception("fix run %s failed", run_id)
@@ -237,6 +243,10 @@ def run_fix_workflow(
             )
             failed = {"status": "failed", "detail": str(exc)}
             await store.set_final(run_id, failed, user_id=user_id)
+            try:
+                await _persist_failed_run(engine, run_id, user_id, target)
+            except Exception:  # noqa: BLE001 - persistence is best-effort
+                logger.exception("persisting failed marker for run %s failed", run_id)
             return failed
         finally:
             if engine is not None:
@@ -244,3 +254,53 @@ def run_fix_workflow(
             await redis.aclose()
 
     return asyncio.run(_inner())
+
+
+async def _persist_finished_run(
+    engine: Any, run_id: str, user_id: str, target: RunTarget, result: dict[str, Any]
+) -> None:
+    """Write the durable ``fix_runs`` row for a completed run (best-effort).
+
+    ``result`` is the compacted state — ``proposed_changes`` are already plain
+    dicts (``_compact_state`` dumps them), so pass them through as-is.
+    """
+    if engine is None:
+        return
+    factory = build_session_factory(engine)
+    async with factory() as session:
+        await persist_run(
+            session,
+            run_id=run_id,
+            user_id=user_id,
+            target=target,
+            status="completed",
+            applied_branch=result.get("applied_branch"),
+            pr_url=result.get("pr_url"),
+            investigation=result.get("investigation"),
+            hypothesis=result.get("root_cause_hypothesis"),
+            proposed_changes=result.get("proposed_changes") or [],
+            evaluation=result.get("evaluation"),
+        )
+
+
+async def _persist_failed_run(
+    engine: Any, run_id: str, user_id: str, target: dict[str, Any]
+) -> None:
+    """Write a failed marker row (best-effort; DB outage must not mask the real error)."""
+    if engine is None:
+        return
+    factory = build_session_factory(engine)
+    async with factory() as session:
+        await persist_run(
+            session,
+            run_id=run_id,
+            user_id=user_id,
+            target=RunTarget.model_validate(target),
+            status="failed",
+            applied_branch=None,
+            pr_url=None,
+            investigation=None,
+            hypothesis=None,
+            proposed_changes=[],
+            evaluation=None,
+        )

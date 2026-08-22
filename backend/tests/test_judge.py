@@ -6,7 +6,7 @@ import json
 from typing import Any
 
 import pytest
-from langchain_core.messages import AI_MESSAGE_TYPE, AIMessage
+from langchain_core.messages import AIMessage
 
 from agentos.agent.state import FileChange, RunTarget
 from agentos.services.judge import (
@@ -37,18 +37,22 @@ VERDICT_JSON = json.dumps(
 
 
 class FakeJudge:
+    """Serves a canned verdict and records the prompt it received."""
+
+    def __init__(self, content: str = VERDICT_JSON) -> None:
+        self.content = content
+        self.messages: list[Any] = []
+
     async def ainvoke(self, messages: list[Any]) -> AIMessage:
         self.messages = messages
-        return AIMessage(content=VERDICT_JSON)
+        return AIMessage(content=self.content)
 
 
-class JudgeResponse(str):
-    pass
+def test_create_judge_llm_targets_judge_model() -> None:
+    from agentos.core.config import get_settings
 
-
-def test_create_judge_llm_is_openai_compatible_chat_model() -> None:
     model = create_judge_llm()
-    assert model.model_name == __import__("agentos.core.config", fromlist=["get_settings"]).get_settings().opencode_judge_model
+    assert model.model_name == get_settings().opencode_judge_model
 
 
 def test_parse_verdict_accepts_fenced_json() -> None:
@@ -72,8 +76,9 @@ def test_build_prompt_includes_changes_and_target() -> None:
         changes=[
             FileChange(
                 path="entrypoint.py",
-                edits=FileChange().edits,
-                explanation="",
+                edits=[],
+                content="",
+                explanation="null guard",
             ),
             FileChange(path="old.py", delete=True),
         ],

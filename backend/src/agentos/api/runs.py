@@ -18,10 +18,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from agentos.api.deps import AuthContext
+from agentos.api.deps import AuthContext, DbSession
 from agentos.core.config import get_settings
 from agentos.core.logging import get_logger
 from agentos.services.run_bus import RunStore
+from agentos.services.run_records import get_run_record, list_run_records
 from agentos.tasks import run_fix_workflow
 
 logger = get_logger(__name__)
@@ -81,31 +82,82 @@ async def start_run(
 
 
 async def _load_run_state(store: RunStore, run_id: str) -> tuple[dict[str, Any] | None, list[str]]:
+    """Live Redis state for a run (``(None, [])`` when the run is unknown)."""
     final = await store.get_final(run_id)
     backlog = await store.backlog(run_id)
-    if final is None and not backlog:
-        raise HTTPException(status_code=404, detail="Run not found")
     return final, backlog
 
 
+@router.get("")
+async def list_runs(
+    auth: AuthContext,
+    db: DbSession,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Durable run history for the authenticated user (newest first)."""
+    if limit > 100:
+        limit = 100
+    return await list_run_records(db, auth.user.id, limit=limit)
+
+
 @router.get("/{run_id}")
-async def get_run(run_id: str, store: RunStoreDep) -> dict[str, Any]:
-    """Current run state: pending events + final result (once completed)."""
+async def get_run(run_id: str, store: RunStoreDep, db: DbSession) -> dict[str, Any]:
+    """Current run state: pending events + final result (once completed).
+
+    Serves the live Redis view while the run is active/warm; falls back to
+    the durable ``fix_runs`` record (+ judge evaluation) after the 24h TTL.
+    """
     final, backlog = await _load_run_state(store, run_id)
-    events = [json.loads(item) for item in backlog]
+    if final is not None or backlog:
+        events = [json.loads(item) for item in backlog]
+        return {
+            "run_id": run_id,
+            "status": (final or {}).get("status", "running"),
+            "state": (final or {}).get("state"),
+            "detail": (final or {}).get("detail"),
+            "events": events,
+        }
+    record = await get_run_record(db, run_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Run not found")
     return {
         "run_id": run_id,
-        "status": (final or {}).get("status", "running"),
-        "state": (final or {}).get("state"),
-        "detail": (final or {}).get("detail"),
-        "events": events,
+        "status": record["status"],
+        "state": {
+            "investigation": record["investigation"],
+            "root_cause_hypothesis": record["root_cause_hypothesis"],
+            "proposed_changes": record["proposed_changes"],
+            "applied_branch": record["applied_branch"],
+            "pr_url": record["pr_url"],
+            "evaluation": record["evaluation"],
+        },
+        "detail": record["status"],
+        "events": [],
+    }
+    if record is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return {
+        "run_id": run_id,
+        "status": record["status"],
+        "state": {
+            "investigation": record["investigation"],
+            "root_cause_hypothesis": record["root_cause_hypothesis"],
+            "proposed_changes": record["proposed_changes"],
+            "applied_branch": record["applied_branch"],
+            "pr_url": record["pr_url"],
+            "evaluation": record["evaluation"],
+        },
+        "detail": record["status"],
+        "events": [],
     }
 
 
 @router.get("/{run_id}/events")
 async def stream_run_events(run_id: str, store: RunStoreDep) -> StreamingResponse:
     """Server-sent events: backlog replay, then live events until the run ends."""
-    await _load_run_state(store, run_id)
+    final, backlog = await _load_run_state(store, run_id)
+    if final is None and not backlog:
+        raise HTTPException(status_code=404, detail="Run not found")
     pubsub = store.redis.pubsub()
 
     async def event_stream() -> AsyncIterator[str]:
