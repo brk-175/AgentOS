@@ -218,14 +218,37 @@ async def create_branch(owner: str, name: str, base_branch: str, new_branch: str
     return {"ref": payload["ref"], "sha": payload["object"]["sha"], "base_sha": base_sha}
 
 
+def _apply_edits(content: str, edits: list[dict[str, str]]) -> str:
+    """Apply find/replace ``edits`` to ``content``; every ``before`` must occur
+    exactly once, or the edit is ambiguous/invalid and the commit must fail."""
+    for edit in edits:
+        before = edit.get("before", "")
+        after = edit.get("after", "")
+        if not before:
+            raise ValueError("each edit needs a non-empty 'before'")
+        occurrences = content.count(before)
+        if occurrences != 1:
+            raise ValueError(
+                f"edit 'before' found {occurrences} times (expected exactly 1): {before[:60]!r}"
+            )
+        content = content.replace(before, after, 1)
+    return content
+
+
 @mcp.tool()
 async def create_commit(
     owner: str, name: str, branch: str, message: str, changes: list[dict[str, Any]]
 ) -> dict[str, Any]:
     """Commit file ``changes`` to ``branch`` in ``owner/name`` as a single commit.
 
-    Each entry in ``changes`` is ``{"path": "...", "content": "..."}`` to
-    create/update a file, or ``{"path": "...", "delete": true}`` to remove it.
+    Each entry in ``changes`` is one of:
+    - ``{"path": "...", "edits": [{"before": "...", "after": "..."}]}`` —
+      surgical find/replace against the file's CURRENT content on the branch
+      (each ``before`` must match exactly once), ideal for small fixes in big
+      files;
+    - ``{"path": "...", "content": "..."}`` — create/replace the file with
+      full new content;
+    - ``{"path": "...", "delete": true}`` — remove the file.
     Commits through the git database API (blobs → tree → commit) and
     fast-forwards the branch ref. Returns the branch and the new commit SHA.
     """
@@ -250,10 +273,19 @@ async def create_commit(
             if change.get("delete"):
                 tree_items.append({"path": change["path"], "sha": None})
                 continue
+            if change.get("edits"):
+                raw_response = await client.get(
+                    f"{base_url}/contents/{quote(change['path'], safe='/')}?ref={branch_ref}",
+                    headers=_github_headers(raw=True),
+                )
+                _check_status(raw_response)
+                content = _apply_edits(raw_response.text, change["edits"])
+            else:
+                content = change.get("content", "")
             response = await client.post(
                 f"{base_url}/git/blobs",
                 headers=_github_headers(),
-                json={"content": change["content"], "encoding": "utf-8"},
+                json={"content": content, "encoding": "utf-8"},
             )
             blob_sha = _json_or_raise(response)["sha"]
             tree_items.append(

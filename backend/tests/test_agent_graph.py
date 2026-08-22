@@ -232,7 +232,13 @@ async def test_investigate_uses_rag_retrieval_context() -> None:
     model = FakeModel(MODEL_JSON, "garbage")
     graph = create_agent_graph(model=model, tools=PLAIN_TOOLS, retrieval=fake_retrieve)
     final = await graph.ainvoke(dict(ISSUE_INPUT))
-    assert calls == [("octocat/Hello-World", "issue #1 in octocat/Hello-World", MAX_RAG_CONTEXT)]
+    assert calls == [
+        (
+            "octocat/Hello-World",
+            "App crashes on empty input Repro: run the app with no arguments.",
+            MAX_RAG_CONTEXT,
+        )
+    ]
     rag_event = next(e for e in final["events"] if e.kind == "rag")
     assert rag_event.detail == "retrieved 2 relevant chunk(s)"
     prompt = next(m for m in model.calls[0] if isinstance(m, HumanMessage)).content
@@ -252,7 +258,7 @@ async def test_investigate_uses_rag_retrieval_context() -> None:
     ]
 
 
-async def test_investigate_uses_target_title_as_retrieval_query() -> None:
+async def test_investigate_uses_issue_title_and_body_as_retrieval_query() -> None:
     queries: list[str] = []
 
     async def fake_retrieve(repo: str, query: str, top_k: int) -> list[ContextDoc]:
@@ -269,7 +275,7 @@ async def test_investigate_uses_target_title_as_retrieval_query() -> None:
         model=FakeModel(MODEL_JSON, "garbage"), tools=PLAIN_TOOLS, retrieval=fake_retrieve
     )
     final = await graph.ainvoke(dict(ISSUE_INPUT, target=target))
-    assert queries == ["App crashes on empty input"]
+    assert queries == ["App crashes on empty input Repro: run the app with no arguments."]
     assert final["investigation"] == "App crashes when run without arguments."
     rag_event = next(e for e in final["events"] if e.kind == "rag")
     assert rag_event.detail == "no relevant chunks found"
@@ -306,6 +312,20 @@ async def test_design_produces_structured_changes() -> None:
     design = next(e for e in final["events"] if e.stage == "design")
     assert design.kind == "design"
     assert design.detail == "2 change(s): entrypoint.py, legacy.py"
+
+
+def test_reject_corrupt_changes_detects_placeholders() -> None:
+    from agentos.agent.graph import _reject_corrupt_changes
+
+    corrupt = [
+        FileChange(
+            path="src/app.tsx",
+            content="import x from 'y'\n// ... rest of modes\n<div className=\"...\">",
+        )
+    ]
+    assert _reject_corrupt_changes(corrupt) == ["src/app.tsx"]
+    healthy = [FileChange(path="src/app.tsx", content="export const a = 1;\n")]
+    assert _reject_corrupt_changes(healthy) == []
 
 
 async def test_design_invalid_patch_falls_back() -> None:
@@ -390,9 +410,10 @@ async def test_full_run_creates_branch_and_commit() -> None:
         {
             "path": "entrypoint.py",
             "content": 'def main():\n    args = sys.argv[1:] or ["default"]\n',
+            "edits": [],
             "delete": False,
         },
-        {"path": "legacy.py", "content": "", "delete": True},
+        {"path": "legacy.py", "content": "", "edits": [], "delete": True},
     ]
     assert pr_calls[0]["tool"] == "create_pull_request"
     assert pr_calls[0]["owner"] == "octocat"

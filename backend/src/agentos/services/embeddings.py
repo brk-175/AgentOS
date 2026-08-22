@@ -20,9 +20,9 @@ def create_embeddings_client() -> OpenAIEmbeddings:
     """OpenRouter-bound embeddings model (dimensions come from settings)."""
     settings = get_settings()
     return OpenAIEmbeddings(
-        base_url=settings.openrouter_base_url,
-        api_key=SecretStr(settings.openrouter_api_key),
-        model=settings.openrouter_embeddings_model,
+        base_url=settings.openai_base_url,
+        api_key=SecretStr(settings.openai_api_key),
+        model=settings.openai_embeddings_model,
         dimensions=settings.embeddings_dimensions,
     )
 

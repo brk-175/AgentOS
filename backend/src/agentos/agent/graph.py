@@ -11,6 +11,7 @@ and opens the pull request.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -28,15 +29,17 @@ from pydantic import SecretStr
 from agentos.agent.state import (
     AgentState,
     ContextDoc,
+    EditPair,
     FileChange,
     Retriever,
     RunEvent,
     RunTarget,
 )
 from agentos.core.config import get_settings
+from agentos.services.rag import significant_keywords
 
 MAX_CONTEXT_FILES = 50
-MAX_FILE_CHARS = 10_000
+MAX_FILE_CHARS = 40_000
 MAX_PROMPT_CONTEXT = 1_00_000
 MAX_RAG_CONTEXT = 50
 MAX_DESIGN_CONTEXT_FILES = 8
@@ -72,12 +75,18 @@ You are editing a real repository, so follow these rules exactly:
    stated intent.
 4. Return STRICT JSON: an ARRAY of change objects. Each object has:
    - "path": repository-relative file path (required)
-   - "content": the FULL new file content (for edits and new files); ignored when
-     "delete" is true
+   - "edits": OPTIONAL list of {"before": "...", "after": "..."} pairs — the
+     MINIMAL surgical change to an EXISTING file. Each "before" must be an
+     exact substring of the current file, unique in the file, and reproduced
+     verbatim; "after" is its replacement. PREFER "edits" for any fix to an
+     existing file — never re-emit full content, and never include elision
+     comments ("// ...") in an edit.
+   - "content": ONLY for brand-new files or full rewrites: the complete new
+     file content. Ignored when "edits" is present.
    - "delete": optional boolean — true to delete the file (content must be "")
    - "explanation": one short sentence about why this change fixes the issue
 
-Never truncate a file: "content" must always be the complete file.
+Never truncate a file and never write placeholder/elision code.
 No prose outside the JSON array."""
 
 _MAX_COMMIT_MESSAGE = 120
@@ -146,15 +155,18 @@ _CONTEXT_MAX_DEPTH = 6  # depth 0 = repo root; each level descends one directory
 
 
 async def _gather_context(
-    tools: Sequence[BaseTool], state: AgentState
+    tools: Sequence[BaseTool],
+    state: AgentState,
+    topic: str = "",
 ) -> tuple[list[ContextDoc], int]:
     """Read promising files, descending into subdirectories (bounded).
 
     Walks the file tree (up to ``_CONTEXT_MAX_DEPTH`` levels) and reads the
     FULL content of the most relevant files so the model edits against the
-    true current source rather than a RAG snippet. Files that would be
-    truncated are skipped. Never raises: on tool failure it degrades to a
-    root listing (today's behavior).
+    true current source rather than a RAG snippet. Prioritizes files whose
+    name matches the issue topic (title + body keywords), then README-ish
+    files, then the rest (bounded by ``MAX_CONTEXT_FILES``). Never raises:
+    on tool failure it degrades to an empty context.
     """
     target = state["target"]
     owner, _, repo = target.repo_full_name.partition("/")
@@ -177,19 +189,27 @@ async def _gather_context(
             kind = entry.get("kind")
             if kind == "dir" and depth > 0:
                 found.extend(await walk(entry["path"], depth - 1))
-            elif (
-                kind == "file"
-                and entry.get("size", 0) <= MAX_FILE_CHARS
-            ):
+            elif kind == "file" and entry.get("size", 0) <= MAX_FILE_CHARS:
                 found.append(entry)
         return found
+
+    topic_words = set(significant_keywords(topic, max_words=6))
+
+    def is_readme(entry: dict[str, Any]) -> bool:
+        return bool(_PATCHABLE_NAME.match(entry.get("name") or ""))
+
+    def is_topic_match(entry: dict[str, Any]) -> bool:
+        name = (entry.get("name") or "").lower()
+        stem = name.rsplit(".", 1)[0]
+        return any(word in name or word in stem for word in topic_words)
 
     try:
         entries = await walk("", _CONTEXT_MAX_DEPTH)
     except Exception:
         return [], 0
     picked = sorted(
-        entries, key=lambda e: not bool(_PATCHABLE_NAME.match(e["name"] or ""))
+        entries,
+        key=lambda e: (not is_topic_match(e), not is_readme(e)),
     )[:MAX_CONTEXT_FILES]
     docs: list[ContextDoc] = []
     for entry in picked:
@@ -204,12 +224,15 @@ async def _gather_context(
 
 
 async def _retrieve_context(
-    retrieval: Retriever, state: AgentState
+    retrieval: Retriever, state: AgentState, topic: str
 ) -> tuple[list[ContextDoc], str]:
-    """Semantic chunk search for the issue; never raises (degrade on failure)."""
-    target = state["target"]
-    query = target.title or f"{target.kind} #{target.number} in {target.repo_full_name}"
-    docs = await retrieval(target.repo_full_name, query, MAX_RAG_CONTEXT)
+    """Retrieve chunks for the issue (semantic + literal keywords).
+
+    ``topic`` combines the issue title and body so genuinely relevant terms
+    ("patch files", "docs "), not just the headline, drive retrieval.
+    Never raises: callers catch exceptions and degrade.
+    """
+    docs = await retrieval(state["target"].repo_full_name, topic, MAX_RAG_CONTEXT)
     if not docs:
         return [], "no relevant chunks found"
     return docs, f"retrieved {len(docs)} relevant chunk(s)"
@@ -269,9 +292,18 @@ async def investigate_node(
             "events": events,
         }
 
+    topic = " ".join(
+        part
+        for part in (
+            str(details.get("title") or state["target"].title or ""),
+            str(details.get("body") or ""),
+        )
+        if part
+    ) or f"{target.kind} #{target.number} in {target.repo_full_name}"
+
     if retrieval is not None:
         try:
-            docs, detail = await _retrieve_context(retrieval, state)
+            docs, detail = await _retrieve_context(retrieval, state, topic)
         except Exception as exc:
             events.append(
                 RunEvent(stage="investigate", kind="rag", detail=f"retrieval failed: {exc}")
@@ -285,7 +317,7 @@ async def investigate_node(
             context_docs.extend(docs)
 
     try:
-        context, files_read = await _gather_context(tools, state)
+        context, files_read = await _gather_context(tools, state, topic)
     except Exception as exc:
         events.append(
             RunEvent(stage="investigate", kind="error", detail=f"context fetch failed: {exc}")
@@ -350,8 +382,11 @@ reorder imports, or drop hooks/effects/routes/handlers. If code must be hidden,
 comment it out in place rather than deleting, unless deletion is the issue's
 explicit intent. If the file did not change, return it unchanged.
 
-Return STRICT JSON: an ARRAY of change objects — the same shape as before
-(path, content, optional delete, explanation). No prose outside the JSON array."""
+Return STRICT JSON: an ARRAY of change objects — the same shape as before.
+Prefer "edits" ([{"before": "...", "after": "..."}] — exact substrings of the
+current file, each unique) over full "content". Only new files use "content".
+(path, optional edits, optional content, optional delete, explanation).
+No prose outside the JSON array."""
 
 
 async def _reproduce_minimal(
@@ -360,9 +395,14 @@ async def _reproduce_minimal(
     target: RunTarget,
     changes: list[FileChange],
     investigation: str,
-) -> tuple[list[FileChange], bool]:
+) -> tuple[list[FileChange] | None, bool]:
     """Re-read each to-be-touched file's full current content and let the model
-    re-emit a minimal, grounded edit (returns ``(changes, repaired)``)."""
+    re-emit a minimal, grounded edit.
+
+    Returns ``(None, False)`` when a target file cannot be read from the repo
+    (two attempts) — a blind rewrite of an unknown file must never be
+    committed, so the caller should treat design as failed.
+    """
     read_tool = _tool(tools, "read_file")
     if read_tool is None:
         return changes, False
@@ -373,12 +413,17 @@ async def _reproduce_minimal(
     blocks: list[str] = []
     existed_paths: list[str] = []
     for change in need_fetch[:10]:
-        try:
-            content = await read_tool.ainvoke(
-                {"owner": owner, "name": repo, "path": change.path}
-            )
-        except Exception:
-            continue  # new file or unreadable — leave as the model wrote it
+        content: str | None = None
+        for _ in range(2):
+            try:
+                content = await read_tool.ainvoke(
+                    {"owner": owner, "name": repo, "path": change.path}
+                )
+                break
+            except Exception:
+                await asyncio.sleep(1)
+        if content is None:
+            return None, False  # ungrounded target file — refuse a blind rewrite
         existed_paths.append(change.path)
         blocks.append(f"### {change.path}\n{content}")
     if not existed_paths:
@@ -408,10 +453,20 @@ async def _reproduce_minimal(
         for change in changes:
             if not change.delete and change.path in repaired and change.path in existed_paths:
                 entry = repaired[change.path]
+                raw_edits = entry.get("edits") or []
+                edits = [
+                    EditPair(
+                        before=str(pair.get("before", "")),
+                        after=str(pair.get("after", "")),
+                    )
+                    for pair in raw_edits
+                    if isinstance(pair, dict) and pair.get("before")
+                ]
                 fixed.append(
                     FileChange(
                         path=str(entry.get("path")),
                         content=str(entry.get("content") or ""),
+                        edits=edits,
                         delete=bool(entry.get("delete", False)),
                         explanation=str(entry.get("explanation") or ""),
                     )
@@ -428,26 +483,40 @@ async def _reproduce_minimal(
 def _design_relevant_context(state: AgentState) -> str:
     """Pick the context docs most relevant to the fix for the design prompt.
 
-    The investigate stage may gather many files (e.g. ``MAX_CONTEXT_FILES``).
-    Feeding all of them to design overloads the model and degrades its output.
-    Order: docs whose path is explicitly named in the investigation first,
-    then ranked RAG chunks, then the rest — capped at
-    ``MAX_DESIGN_CONTEXT_FILES``.
+    The investigate stage may gather many files (e.g. ``MAX_CONTEXT_FILES``)
+    plus RAG/keyword chunks that duplicate paths. Feeding all of them to
+    design overloads the model and degrades its output. Ranking is per-file
+    (one doc per path — the highest-ranked chunk): paths explicitly named in
+    the investigation first, then docs whose *content* literally contains
+    investigation keywords (e.g. a keyword-retrieved file like ``page.tsx``
+    for a "patch files" issue), then scored RAG chunks — capped at
+    ``MAX_DESIGN_CONTEXT_FILES`` files.
     """
     docs = state["context"]
     if not docs:
         return "(no repo context was gathered)"
-    probe = f"{state['investigation'] or ''} {state['root_cause_hypothesis'] or ''}".lower()
+    probe = f"{state['investigation'] or ''} {state['root_cause_hypothesis'] or ''}"
+    probe_lower = probe.lower()
+    keywords = significant_keywords(probe)
 
-    def named(doc: ContextDoc) -> bool:
+    def content_hits(doc: ContextDoc) -> int:
+        if not keywords:
+            return 0
+        lowered = doc.content.lower()
+        return sum(1 for keyword in keywords if keyword in lowered)
+
+    def rank(doc: ContextDoc) -> tuple[bool, int, bool, float, int]:
         basename = doc.path.rsplit("/", 1)[-1]
         stem = basename.rsplit(".", 1)[0].lower()
-        return stem in probe or basename.lower() in probe
+        is_named = stem in probe_lower or basename.lower() in probe_lower
+        # longer content wins ties: full-file reads beat short RAG chunks
+        return (is_named, content_hits(doc), doc.score is not None, doc.score or 0.0, len(doc.content))
 
-    named_docs = [doc for doc in docs if named(doc)]
-    rest = [doc for doc in docs if not named(doc)]
-    rest.sort(key=lambda doc: (doc.score is None, doc.score or 0.0), reverse=True)
-    picked = (named_docs + rest)[:MAX_DESIGN_CONTEXT_FILES]
+    ranked = sorted(docs, key=rank, reverse=True)
+    best_by_path: dict[str, ContextDoc] = {}
+    for doc in ranked:
+        best_by_path.setdefault(doc.path, doc)
+    picked = list(best_by_path.values())[:MAX_DESIGN_CONTEXT_FILES]
     return "\n\n".join(f"### {doc.path}\n{doc.content}" for doc in picked)
 
 
@@ -490,10 +559,17 @@ async def design_node(
         for entry in raw:
             if not isinstance(entry, dict) or not entry.get("path"):
                 continue
+            raw_edits = entry.get("edits") or []
+            edits = [
+                EditPair(before=str(pair.get("before", "")), after=str(pair.get("after", "")))
+                for pair in raw_edits
+                if isinstance(pair, dict) and pair.get("before")
+            ]
             changes.append(
                 FileChange(
                     path=str(entry["path"]),
                     content=str(entry.get("content") or ""),
+                    edits=edits,
                     delete=bool(entry.get("delete", False)),
                     explanation=str(entry.get("explanation") or ""),
                 )
@@ -508,6 +584,16 @@ async def design_node(
         ground, repaired = await _reproduce_minimal(
             model, tools, target, changes, state["investigation"] or ""
         )
+        if ground is None:
+            if not repaired:
+                events.append(
+                    RunEvent(
+                        stage="design",
+                        kind="error",
+                        detail="design aborted: could not read a target file to ground the edit",
+                    )
+                )
+            return {"proposed_changes": [], "events": events}
         if repaired:
             changes = ground
             events.append(
@@ -518,6 +604,17 @@ async def design_node(
                 )
             )
 
+    corrupt = _reject_corrupt_changes(changes)
+    if corrupt:
+        events.append(
+            RunEvent(
+                stage="design",
+                kind="error",
+                detail=f"design rejected: placeholder/truncated content in {', '.join(corrupt)}",
+            )
+        )
+        return {"proposed_changes": [], "events": events}
+
     paths = ", ".join(c.path for c in changes[:5])
     events.append(
         RunEvent(
@@ -527,6 +624,29 @@ async def design_node(
         )
     )
     return {"proposed_changes": changes, "events": events}
+
+
+_CORRUPT_CONTENT_MARKERS = (
+    "// ... other imports",  # LLM placeholder — not real code
+    "// ... other state",
+    "// ... rest of modes",
+    "// ... other sections",
+    "/* ... */",  # bare elision comment
+    "<div className=\"...\">",  # placeholder JSX class
+    "<header className=\"...\">",
+    "// ... rest of file",
+)
+
+
+def _reject_corrupt_changes(changes: list[FileChange]) -> list[str]:
+    """Return the paths whose ``content`` looks like LLM-truncated placeholder
+    code (elision comments instead of real content). Such changes must never
+    be committed — they silently delete real logic."""
+    return [
+        change.path
+        for change in changes
+        if not change.delete and any(marker in change.content for marker in _CORRUPT_CONTENT_MARKERS)
+    ]
 
 
 def _branch_name(target: RunTarget, *, unique: bool) -> str:
@@ -577,7 +697,9 @@ async def apply_node(
     if target.title:
         message = f"{message}: {target.title}"
     message = message[:_MAX_COMMIT_MESSAGE]
-    payload = [change.model_dump(include={"path", "content", "delete"}) for change in changes]
+    payload = [
+        change.model_dump(include={"path", "content", "edits", "delete"}) for change in changes
+    ]
     try:
         branch_result = json.loads(
             await branch_tool.ainvoke(

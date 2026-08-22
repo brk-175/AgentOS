@@ -30,15 +30,30 @@ class RunTarget(BaseModel):
     base_branch: str = "main"
 
 
+class EditPair(BaseModel):
+    """An exact textual replacement inside an existing file.
+
+    ``before`` must occur EXACTLY once in the file; ``after`` replaces it.
+    This is the smallest possible edit unit — the model can fix a 24 KB file
+    with a handful of tiny pairs instead of re-emitting the whole file (which
+    truncates on output-token limits).
+    """
+
+    before: str
+    after: str
+
+
 class FileChange(BaseModel):
     """One file modification proposed by the agent (structured patch entry).
 
-    ``content`` set + ``delete=False`` creates/updates the file;
-    ``delete=True`` removes it. Consumed deterministically by the apply node.
+    Three modes: ``edits`` for surgical find/replace on an existing file,
+    ``content`` (full new content) for new files, ``delete=True`` to remove a
+    file. Consumed deterministically by the apply node.
     """
 
     path: str
     content: str = ""
+    edits: list[EditPair] = []
     delete: bool = False
     explanation: str = ""
 

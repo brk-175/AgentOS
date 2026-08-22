@@ -1,22 +1,25 @@
 """RAG: index repository files into pgvector and search them semantically.
 
-``index_repository`` replaces the stored chunks for a repo (idempotent),
-reading files either from an injected source (tests) or by walking the repo
-through the GitHub MCP tools (bounded: depth 2, ≤ ``max_files`` files, each
-≤ ``max_chars``). ``search_repository`` returns the top-k chunks by cosine
-similarity — via the pgvector ``<=>`` operator on Postgres, via an in-Python
-scan on other dialects (sqlite tests).
+``index_repository`` incrementally syncs the stored chunks for a repo:
+chunks whose content is byte-identical keep their existing embedding (no
+embedding API call), only new/changed chunks are embedded, and rows for
+files that disappeared are removed. Files are read either from an injected
+source (tests) or by walking the repo through the GitHub MCP tools (bounded
+by depth and per-file/whole-repo caps). ``search_repository`` returns the
+top-k chunks by cosine similarity — via the pgvector ``<=>`` operator on
+Postgres, via an in-Python scan on other dialects (sqlite tests).
 """
 
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from math import sqrt
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from agentos.agent.mcp_adapter import GitHubMCPTools
@@ -29,7 +32,7 @@ from agentos.services.embeddings import chunk_text, create_embeddings_client
 logger = get_logger(__name__)
 
 MAX_INDEX_FILES = 100
-MAX_INDEX_FILE_CHARS = 10_000
+MAX_INDEX_FILE_CHARS = 40_000
 MAX_DEPTH = 10  # depth 0 = repo root; each index adds one level
 
 
@@ -49,6 +52,7 @@ class IndexSummary:
     files_indexed: int
     chunks: int
     chars: int
+    chunks_embedded: int = 0
 
 
 @dataclass(frozen=True)
@@ -97,6 +101,8 @@ async def _fetch_repo_files(
         files: list[ContentFile] = []
         for path in (await walk("", MAX_DEPTH))[:max_files]:
             content = await read_tool.ainvoke({"owner": owner, "name": repo, "path": path})
+            if "\x00" in content[:4096]:
+                continue  # binary file (NUL bytes) — not text, not indexable
             files.append(ContentFile(path=path, content=content))
         return files
 
@@ -111,7 +117,15 @@ async def index_repository(
     max_files: int = MAX_INDEX_FILES,
     max_chars: int = MAX_INDEX_FILE_CHARS,
 ) -> IndexSummary:
-    """(Re)build the chunk index for a repository; replaces existing rows."""
+    """(Re)build the chunk index for a repository — incrementally.
+
+    Chunks whose ``content`` is byte-identical to an already-stored row keep
+    their existing embedding (no embedding API call). Only new chunks and
+    chunks whose text changed are embedded. Rows for files/chunks that are no
+    longer present are removed. Re-indexing an unchanged repo therefore costs
+    zero embedding tokens; the fetched-file/count columns report the full
+    repo, ``chunks_embedded`` reports what actually hit the embedder.
+    """
     source = (
         files
         if files is not None
@@ -119,40 +133,77 @@ async def index_repository(
             access_token, repo_full_name, max_files=max_files, max_chars=max_chars
         )
     )
-    if source:
-        embedder = embeddings if embeddings is not None else create_embeddings_client()
 
     chunks: list[tuple[str, int, str]] = []
     chars = 0
     for file in source:
-        for index, piece in enumerate(chunk_text(file.content)):
+        content = file.content.replace("\x00", "")  # Postgres cannot store NUL bytes
+        for index, piece in enumerate(chunk_text(content)):
             chunks.append((file.path, index, piece))
             chars += len(piece)
 
-    await db.execute(
-        delete(RepositoryDocument).where(RepositoryDocument.repo_full_name == repo_full_name)
-    )
-    if chunks:
-        vectors = await embedder.aembed_documents([text for _, _, text in chunks])
-        db.add_all(
-            [
-                RepositoryDocument(
-                    repo_full_name=repo_full_name,
-                    path=path,
-                    chunk_index=index,
-                    content=text,
-                    embedding=list(vector),
+    target_keys = {(path, index) for path, index, _ in chunks}
+    existing = {
+        (row.path, row.chunk_index): row
+        for row in (
+            await db.scalars(
+                select(RepositoryDocument).where(
+                    RepositoryDocument.repo_full_name == repo_full_name
                 )
-                for (path, index, text), vector in zip(chunks, vectors, strict=True)
-            ]
-        )
+            )
+        ).all()
+    }
+
+    stale = [
+        row for (path, index), row in existing.items() if (path, index) not in target_keys
+    ]
+    for row in stale:
+        await db.delete(row)
+
+    to_embed: list[tuple[str, int, str]] = []
+    for path, index, text in chunks:
+        existing_row = existing.get((path, index))
+        if existing_row is not None and existing_row.content == text:
+            continue  # unchanged — reuse the stored embedding
+        to_embed.append((path, index, text))
+
+    if to_embed:
+        embedder = embeddings if embeddings is not None else create_embeddings_client()
+        vectors = await embedder.aembed_documents([text for _, _, text in to_embed])
+        new_rows: list[RepositoryDocument] = []
+        for (path, index, text), vector in zip(to_embed, vectors, strict=True):
+            existing_row = existing.get((path, index))
+            if existing_row is not None:
+                existing_row.content = text
+                existing_row.embedding = list(vector)
+            else:
+                new_rows.append(
+                    RepositoryDocument(
+                        repo_full_name=repo_full_name,
+                        path=path,
+                        chunk_index=index,
+                        content=text,
+                        embedding=list(vector),
+                    )
+                )
+        db.add_all(new_rows)
+
     await db.commit()
-    logger.info("indexed %s: %d files, %d chunks", repo_full_name, len(source), len(chunks))
+    logger.info(
+        "indexed %s: %d files, %d chunks (%d new/changed embedded, %d reused, %d stale removed)",
+        repo_full_name,
+        len(source),
+        len(chunks),
+        len(to_embed),
+        len(chunks) - len(to_embed),
+        len(stale),
+    )
     return IndexSummary(
         repo_full_name=repo_full_name,
         files_indexed=len(source),
         chunks=len(chunks),
         chars=chars,
+        chunks_embedded=len(to_embed),
     )
 
 
@@ -164,6 +215,27 @@ def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return dot / (norm_a * norm_b)
+
+
+_KEYWORD_STOPWORDS = frozenset(
+    ["a", "an", "and", "are", "as", "at", "be", "been", "being", "but", "by", "can", "could", "did", "do", "does", "done", "for", "from", "had", "has", "have", "he", "her", "here", "his", "how", "i", "if", "in", "into", "is", "it", "its", "just", "like", "made", "make", "may", "me", "mine", "more", "most", "must", "my", "no", "nor", "not", "now", "of", "off", "on", "once", "only", "or", "other", "our", "out", "over", "own", "same", "she", "should", "so", "some", "such", "than", "that", "the", "their", "them", "then", "there", "these", "they", "this", "those", "through", "to", "too", "under", "until", "up", "upon", "very", "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom", "why", "will", "with", "would", "you", "your", "yours", "itself", "myself", "ourselves", "themselves", "ourselves"]
+)
+
+
+def significant_keywords(text: str, *, max_words: int = 8) -> list[str]:
+    """Extract the most content-bearing words from a query/issue text.
+
+    Words are lowercased, stripped of non-alphanumerics and common stopwords,
+    and capped at ``max_words``. Used as the literal-content fallback for
+    retrieval, so files whose *content* mentions an issue's terms surface
+    even when their embedding ranks below the similarity threshold.
+    """
+    tokens = [w for w in re.findall(r"[a-z0-9]{4,}", text.lower()) if w not in _KEYWORD_STOPWORDS]
+    counts: dict[str, int] = {}
+    for token in tokens:
+        counts[token] = counts.get(token, 0) + 1
+    ranked = sorted(counts.items(), key=lambda pair: (-pair[1], -len(pair[0])))
+    return [word for word, _ in ranked[:max_words]]
 
 
 async def search_repository(
@@ -231,11 +303,45 @@ def build_retriever(
                 top_k=limit,
                 threshold=threshold,
             )
-        return [
-            ContextDoc(
-                path=hit.path, content=hit.content, chunk_index=hit.chunk_index, score=hit.score
-            )
-            for hit in hits
-        ]
+            docs = [
+                ContextDoc(
+                    path=hit.path,
+                    content=hit.content,
+                    chunk_index=hit.chunk_index,
+                    score=hit.score,
+                )
+                for hit in hits
+            ]
+            seen = {(doc.path, doc.chunk_index) for doc in docs}
+            extendable = limit - len(docs)
+            keywords = significant_keywords(query)
+            if extendable > 0 and keywords:
+                clauses = [
+                    RepositoryDocument.content.ilike(f"%{keyword}%") for keyword in keywords
+                ]
+                rows = (
+                    await session.scalars(
+                        select(RepositoryDocument).where(
+                            RepositoryDocument.repo_full_name == repo_full_name,
+                            or_(*clauses),
+                        )
+                    )
+                ).all()
+                for row in rows:
+                    if (row.path, row.chunk_index) in seen:
+                        continue
+                    seen.add((row.path, row.chunk_index))
+                    # literal match — no cosine score; rendered without provenance
+                    docs.append(
+                        ContextDoc(
+                            path=row.path,
+                            content=row.content,
+                            chunk_index=row.chunk_index,
+                            score=None,
+                        )
+                    )
+                    if len(docs) >= limit:
+                        break
+        return docs
 
     return retrieve

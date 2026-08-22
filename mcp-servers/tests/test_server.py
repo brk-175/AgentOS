@@ -297,6 +297,87 @@ async def test_create_commit_upserts_and_deletes(monkeypatch: pytest.MonkeyPatch
     ]
 
 
+def test_apply_edits_replaces_unique_substrings() -> None:
+    content = "hello world\nfoo bar\n"
+    result = server._apply_edits(content, [{"before": "world", "after": "there"}])
+    assert result == "hello there\nfoo bar\n"
+
+
+def test_apply_edits_rejects_multiple_occurrences() -> None:
+    with pytest.raises(ValueError, match="found 2 times"):
+        server._apply_edits("a a", [{"before": "a", "after": "b"}])
+    with pytest.raises(ValueError, match="found 0 times"):
+        server._apply_edits("xyz", [{"before": "missing", "after": "b"}])
+
+
+async def test_create_commit_applies_edits_against_current_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "GITHUB_TOKEN", "test-token")
+    seen: list[tuple[str, str]] = []
+    blob_bodies: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path))
+        if request.url.path.endswith("/git/ref/heads/main"):
+            return httpx.Response(200, json={"object": {"sha": "base_commit"}})
+        if request.url.path.endswith("/git/commits/base_commit"):
+            return httpx.Response(200, json={"tree": {"sha": "base_tree"}})
+        if "contents/app.py" in request.url.path:
+            return httpx.Response(200, text="old word here\n")
+        if request.url.path.endswith("/git/blobs"):
+            blob_bodies.append(json.loads(request.read())["content"])
+            return httpx.Response(201, json={"sha": "blob_sha"})
+        if request.url.path.endswith("/git/trees"):
+            body = json.loads(request.read())
+            assert body["tree"] == [
+                {"path": "app.py", "mode": "100644", "type": "blob", "sha": "blob_sha"}
+            ]
+            return httpx.Response(201, json={"sha": "new_tree"})
+        if request.url.path.endswith("/git/commits"):
+            return httpx.Response(201, json={"sha": "commit_sha"})
+        if request.method == "PATCH":
+            return httpx.Response(200, json={"ref": "refs/heads/main"})
+        return httpx.Response(500)
+
+    _mock_client(monkeypatch, handler)
+    result = await server.create_commit(
+        "octo",
+        "repo",
+        "main",
+        "fix bug",
+        [{"path": "app.py", "edits": [{"before": "old word", "after": "new word"}]}],
+    )
+    assert result == {"branch": "main", "commit_sha": "commit_sha"}
+    assert blob_bodies == ["new word here\n"]
+    assert ("GET", "/repos/octo/repo/contents/app.py") in seen
+
+
+async def test_create_commit_edits_fail_when_before_not_unique(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "GITHUB_TOKEN", "test-token")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/git/ref/heads/main"):
+            return httpx.Response(200, json={"object": {"sha": "base_commit"}})
+        if request.url.path.endswith("/git/commits/base_commit"):
+            return httpx.Response(200, json={"tree": {"sha": "base_tree"}})
+        if "contents/app.py" in request.url.path:
+            return httpx.Response(200, text="dup dup\n")
+        return httpx.Response(500)
+
+    _mock_client(monkeypatch, handler)
+    with pytest.raises(ValueError, match="found 2 times"):
+        await server.create_commit(
+            "octo",
+            "repo",
+            "main",
+            "fix bug",
+            [{"path": "app.py", "edits": [{"before": "dup", "after": "x"}]}],
+        )
+
+
 async def test_create_commit_rejects_empty_changes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(server, "GITHUB_TOKEN", "test-token")
     _mock_client(monkeypatch, lambda request: httpx.Response(500))

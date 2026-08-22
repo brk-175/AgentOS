@@ -12,6 +12,7 @@ from agentos.services.rag import (
     build_retriever,
     index_repository,
     search_repository,
+    significant_keywords,
 )
 
 DIMENSIONS = 1536
@@ -31,7 +32,11 @@ QUERY_VECTORS: dict[str, list[float]] = {
 class FakeEmbeddings:
     """Deterministic scripted embeddings (no network, no randomness)."""
 
+    def __init__(self) -> None:
+        self.embedded_documents: list[str] = []
+
     async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
+        self.embedded_documents.extend(texts)
         return [self._pad(DOC_VECTORS.get(text, [0.0, 0.0, 0.0])) for text in texts]
 
     async def aembed_query(self, text: str) -> list[float]:
@@ -88,6 +93,107 @@ async def test_index_stores_chunks_and_replaces_previous_index(
             files=[ContentFile(path="src/entrypoint.py", content="def main():\n    pass\n")],
         )
         assert await _count_documents(session, "octocat/AgentOS") == 1
+
+
+async def test_reindex_unchanged_repo_embeds_nothing(
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    files = [
+        ContentFile(path="README.md", content="AgentOS fixes GitHub issues fast."),
+        ContentFile(path="src/entrypoint.py", content="def main():\n    pass\n"),
+    ]
+    async with db_factory() as session:
+        embedder = FakeEmbeddings()
+        first = await index_repository(
+            session,
+            "tok",
+            "octocat/AgentOS",
+            embeddings=embedder,
+            files=files,
+        )
+        assert first.chunks_embedded == 2
+        assert len(embedder.embedded_documents) == 2
+
+        embedder.embedded_documents.clear()
+        second = await index_repository(
+            session,
+            "tok",
+            "octocat/AgentOS",
+            embeddings=embedder,
+            files=files,
+        )
+        assert second.chunks_embedded == 0
+        assert embedder.embedded_documents == []
+        assert await _count_documents(session, "octocat/AgentOS") == 2
+
+        rows = (await session.scalars(select(RepositoryDocument))).all()
+        assert {row.path for row in rows} == {"README.md", "src/entrypoint.py"}
+        assert all(len(row.embedding) == DIMENSIONS for row in rows)
+
+
+async def test_reindex_only_embeds_changed_chunks(
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    original = [ContentFile(path="README.md", content="AgentOS fixes GitHub issues fast.")]
+    async with db_factory() as session:
+        await index_repository(
+            session, "tok", "octocat/AgentOS", embeddings=FakeEmbeddings(), files=original
+        )
+
+    changed = [
+        ContentFile(path="README.md", content="AgentOS fixes GitHub issues - superset text."),
+        ContentFile(path="docs/new.md", content="brand new file"),
+    ]
+    async with db_factory() as session:
+        embedder = FakeEmbeddings()
+        summary = await index_repository(
+            session,
+            "tok",
+            "octocat/AgentOS",
+            embeddings=embedder,
+            files=changed,
+        )
+        assert summary.chunks_embedded == 2  # changed README + new docs/new.md
+        assert set(embedder.embedded_documents) == {
+            "AgentOS fixes GitHub issues - superset text.",
+            "brand new file",
+        }
+        assert await _count_documents(session, "octocat/AgentOS") == 2
+        rows = (await session.scalars(select(RepositoryDocument))).all()
+        assert {row.path for row in rows} == {"README.md", "docs/new.md"}
+
+
+async def test_significant_keywords_extracts_content_terms() -> None:
+    assert significant_keywords("remove the mentions of patch files to avoid ambiguity")[
+        :5
+    ] == ["ambiguity", "mentions", "remove", "patch", "files"]
+    assert significant_keywords("the and of a an are is for it") == []
+
+
+async def test_retriever_keyword_fallback_surfaces_literal_matches(
+    db_engine: AsyncEngine,
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    files = [
+        ContentFile(path="web/src/app/page.tsx", content="Paste a git diff / patch file to begin review."),
+        ContentFile(path="src/crash.py", content="crash on empty input null pointer bug"),
+    ]
+    async with db_factory() as session:
+        await index_repository(
+            session,
+            "tok",
+            "octocat/demo",
+            embeddings=FakeEmbeddings(),
+            files=files,
+        )
+    retrieve = build_retriever(db_engine, embeddings=FakeEmbeddings(), top_k=5)
+    docs = await retrieve("octocat/demo", "remove mentions of patch files from the UI copy")
+    paths = {doc.path for doc in docs}
+    # page.tsx ranks low semantically (its embedding is the zero vector) but its
+    # content literally contains "patch"/"file", so the keyword fallback must add it.
+    assert "web/src/app/page.tsx" in paths
+    page_doc = next(doc for doc in docs if doc.path == "web/src/app/page.tsx")
+    assert page_doc.score is None  # literal match — no cosine provenance
 
 
 async def test_search_ranks_most_similar_chunk_first(

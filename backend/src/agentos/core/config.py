@@ -56,9 +56,9 @@ class Settings(BaseSettings):
     fernet_key: str = Field(init=False)
 
     # --- OpenRouter ---
-    openrouter_api_key: str = Field(init=False)
-    openrouter_base_url: str = Field(init=False)
-    openrouter_embeddings_model: str = Field(init=False)
+    openai_api_key: str = Field(init=False)
+    openai_base_url: str = Field(init=False)
+    openai_embeddings_model: str = Field(init=False)
 
     # --- OpenCode ---
     opencode_api_key: str = Field(init=False)
