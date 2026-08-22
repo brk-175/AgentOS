@@ -73,6 +73,9 @@ export default function DashboardPage() {
           </Link>
           {view === "ready" && user && (
             <div className="flex items-center gap-3">
+              <Button variant="ghost" size="sm" className="cursor-pointer">
+                <Link href="/runs">Runs</Link>
+              </Button>
               <span className="flex items-center gap-2 text-sm text-muted-foreground">
                 <Avatar className="size-7">
                   {user.avatar_url ? <AvatarImage src={user.avatar_url} alt={user.username} /> : null}

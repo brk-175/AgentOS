@@ -64,3 +64,100 @@ export async function logout(): Promise<void> {
     credentials: "include",
   });
 }
+
+export interface JudgeScores {
+  correctness: number;
+  minimality: number;
+  behavior_preservation: number;
+  grounding: number;
+}
+
+export type JudgeVerdictValue = "approved" | "changes_requested" | "failed";
+
+export interface RunEvaluation {
+  verdict: JudgeVerdictValue;
+  scores: JudgeScores;
+  summary: string;
+  issues: string[];
+}
+
+export interface ProposedChange {
+  path: string;
+  content?: string;
+  edits?: { before: string; after: string }[];
+  delete?: boolean;
+  explanation?: string;
+}
+
+export interface RunRecord {
+  run_id: string;
+  repo_full_name: string;
+  kind: string;
+  number: number | null;
+  title: string;
+  base_branch: string;
+  status: string;
+  applied_branch: string | null;
+  pr_url: string | null;
+  investigation: string;
+  root_cause_hypothesis: string;
+  proposed_changes: ProposedChange[];
+  evaluation: RunEvaluation | null;
+  completed_at: string | null;
+}
+
+export interface RunEvent {
+  type: string;
+  stage?: string;
+  kind?: string;
+  detail?: string;
+  time?: string;
+}
+
+export interface RunDetail {
+  run_id: string;
+  status: string;
+  state: {
+    investigation?: string | null;
+    root_cause_hypothesis?: string | null;
+    proposed_changes?: ProposedChange[];
+    applied_branch?: string | null;
+    pr_url?: string | null;
+    evaluation?: RunEvaluation | null;
+  } | null;
+  detail?: string | null;
+  events: RunEvent[];
+}
+
+export function getRuns(): Promise<RunRecord[]> {
+  return getJSON<RunRecord[]>("/api/v1/runs?limit=50");
+}
+
+export function getRun(runId: string): Promise<RunDetail> {
+  return getJSON<RunDetail>(`/api/v1/runs/${runId}`);
+}
+
+/** Subscribe to a run's SSE event stream; returns a close() function. */
+export function subscribeRunEvents(
+  runId: string,
+  onEvent: (event: RunEvent) => void,
+  onClose: () => void,
+): () => void {
+  const source = new EventSource(`${API_URL}/api/v1/runs/${runId}/events`, {
+    withCredentials: true,
+  });
+  source.onmessage = (message) => {
+    try {
+      onEvent(JSON.parse(message.data) as RunEvent);
+    } catch {
+      // malformed SSE payload — ignore
+    }
+  };
+  source.onerror = () => {
+    source.close();
+    onClose();
+  };
+  return () => {
+    source.close();
+  };
+}
