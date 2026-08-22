@@ -25,6 +25,7 @@ from agentos.agent.mcp_adapter import GitHubMCPTools
 from agentos.agent.state import Retriever, RunTarget
 from agentos.core.config import get_settings
 from agentos.db.session import build_engine
+from agentos.services.judge import create_judge_llm, evaluate_run
 from agentos.services.rag import build_retriever
 from agentos.services.run_bus import RunStore
 
@@ -63,12 +64,15 @@ async def execute_run(
     model: Any = None,
     tools: Sequence[BaseTool] | None = None,
     retrieval: Retriever | None = None,
+    judge: Any = None,
 ) -> dict[str, Any]:
     """Run the fix-agent pipeline, publishing each fresh event as it happens.
 
-    ``model``/``tools``/``retrieval`` are injectable for tests; by default the
-    task boots the real OpenRouter model and the GitHub MCP server with the
-    user's token.
+    ``model``/``tools``/``retrieval``/``judge`` are injectable for tests; by
+    default the task boots the real opencode agent model and the GitHub MCP
+    server with the user's token. When ``judge`` is provided (or a real model
+    is active), the completed run is scored by the judge LLM and the verdict
+    lands in the terminal state + an ``eval`` event (degradable).
     """
     initial = {
         "target": target,
@@ -106,13 +110,79 @@ async def execute_run(
             elif first_snapshot:
                 await publish({"run_id": run_id, "type": "start"})
             first_snapshot = False
-        await publish({"run_id": run_id, "type": "final", "state": _compact_state(final)})
-        return _compact_state(final)
+        state = _compact_state(final)
+        state["evaluation"] = await _evaluate(
+            run_id, target, final, judge=judge, publish=publish
+        )
+        await publish({"run_id": run_id, "type": "final", "state": state})
+        return state
 
     if tools is None:
         async with GitHubMCPTools(token=access_token) as adapter:
             return await stream(adapter.tools)
     return await stream(tools)
+
+
+async def _evaluate(
+    run_id: str,
+    target: RunTarget,
+    final: dict[str, Any],
+    *,
+    judge: Any,
+    publish: Callable[[dict[str, Any]], Awaitable[None]],
+) -> dict[str, Any] | None:
+    """Score the finished run with the judge model; degrade on any failure.
+
+    Skipped entirely when no judge is available (unit-test stub mode).
+    Returns the serialized verdict dict (or ``None`` when evaluation was
+    skipped/failed) and publishes an ``eval`` event for the SSE stream.
+    """
+    if judge is None:
+        return None
+    changes = final.get("proposed_changes") or []
+    if not changes:
+        await publish(
+            {
+                "run_id": run_id,
+                "type": "event",
+                "stage": "eval",
+                "kind": "skip",
+                "detail": "no changes to evaluate",
+            }
+        )
+        return None
+    try:
+        verdict = await evaluate_run(
+            target,
+            investigation=final.get("investigation"),
+            hypothesis=final.get("root_cause_hypothesis"),
+            changes=changes,
+            applied_branch=final.get("applied_branch"),
+            pr_url=final.get("pr_url"),
+            judge=judge,
+        )
+    except Exception as exc:  # noqa: BLE001 - evaluation must never kill the run
+        logger.exception("judge evaluation for %s failed", target.repo_full_name)
+        await publish(
+            {
+                "run_id": run_id,
+                "type": "event",
+                "stage": "eval",
+                "kind": "error",
+                "detail": f"evaluation failed: {exc}",
+            }
+        )
+        return None
+    await publish(
+        {
+            "run_id": run_id,
+            "type": "event",
+            "stage": "eval",
+            "kind": "verdict",
+            "detail": f"{verdict.verdict} (score {verdict.scores.model_dump()})",
+        }
+    )
+    return verdict.model_dump()
 
 
 @celery_app.task(name="agentos.run_fix_workflow")
@@ -150,6 +220,7 @@ def run_fix_workflow(
                 access_token,
                 publish=publish,
                 retrieval=retrieval,
+                judge=create_judge_llm(),
             )
             await store.set_final(run_id, {"status": "completed", "state": result}, user_id=user_id)
             return result

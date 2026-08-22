@@ -17,7 +17,7 @@ from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 
-Stage = Literal["investigate", "design", "apply", "pr"]
+Stage = Literal["investigate", "design", "apply", "pr", "eval"]
 
 
 class RunTarget(BaseModel):
