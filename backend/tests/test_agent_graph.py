@@ -11,7 +11,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import StructuredTool, ToolException
 from langchain_openai import ChatOpenAI
 
-from agentos.agent.graph import create_agent_graph, create_agent_llm
+from agentos.agent.graph import MAX_RAG_CONTEXT, create_agent_graph, create_agent_llm
 from agentos.agent.mcp_adapter import (
     GitHubMCPTools,
     default_github_mcp_command,
@@ -232,7 +232,7 @@ async def test_investigate_uses_rag_retrieval_context() -> None:
     model = FakeModel(MODEL_JSON, "garbage")
     graph = create_agent_graph(model=model, tools=PLAIN_TOOLS, retrieval=fake_retrieve)
     final = await graph.ainvoke(dict(ISSUE_INPUT))
-    assert calls == [("octocat/Hello-World", "issue #1 in octocat/Hello-World", 5)]
+    assert calls == [("octocat/Hello-World", "issue #1 in octocat/Hello-World", MAX_RAG_CONTEXT)]
     rag_event = next(e for e in final["events"] if e.kind == "rag")
     assert rag_event.detail == "retrieved 2 relevant chunk(s)"
     prompt = next(m for m in model.calls[0] if isinstance(m, HumanMessage)).content
@@ -364,7 +364,7 @@ async def test_full_run_creates_branch_and_commit() -> None:
         model=FakeModel(MODEL_JSON, DESIGN_JSON, PR_SUMMARY_JSON), tools=tools, token="ght_test"
     )
     final = await graph.ainvoke(dict(ISSUE_INPUT))
-    assert final["applied_branch"] == "fix/issue-1"
+    assert final["applied_branch"].startswith("fix/issue-1-")
     assert final["pr_url"] == "https://github.com/octocat/Hello-World/pull/42"
     assert [event.kind for event in final["events"]] == [
         "target",
@@ -379,14 +379,12 @@ async def test_full_run_creates_branch_and_commit() -> None:
     assert final["events"][-1].detail == (
         "opened PR #42: https://github.com/octocat/Hello-World/pull/42"
     )
-    assert branch_calls[0] == {
-        "tool": "create_branch",
-        "owner": "octocat",
-        "name": "Hello-World",
-        "base_branch": "main",
-        "new_branch": "fix/issue-1",
-    }
-    assert commit_calls[0]["branch"] == "fix/issue-1"
+    assert branch_calls[0]["tool"] == "create_branch"
+    assert branch_calls[0]["owner"] == "octocat"
+    assert branch_calls[0]["name"] == "Hello-World"
+    assert branch_calls[0]["base_branch"] == "main"
+    assert branch_calls[0]["new_branch"].startswith("fix/issue-1-")
+    assert commit_calls[0]["branch"] == branch_calls[0]["new_branch"]
     assert commit_calls[0]["message"].startswith("AgentOS: fix issue #1")
     assert commit_calls[0]["changes"] == [
         {
@@ -396,15 +394,13 @@ async def test_full_run_creates_branch_and_commit() -> None:
         },
         {"path": "legacy.py", "content": "", "delete": True},
     ]
-    assert pr_calls[0] == {
-        "tool": "create_pull_request",
-        "owner": "octocat",
-        "name": "Hello-World",
-        "title": "fix: default args so the app stops crashing",
-        "head": "fix/issue-1",
-        "base": "main",
-        "body": "## What\nAdds default CLI args.\n\n## Files\n- entrypoint.py",
-    }
+    assert pr_calls[0]["tool"] == "create_pull_request"
+    assert pr_calls[0]["owner"] == "octocat"
+    assert pr_calls[0]["name"] == "Hello-World"
+    assert pr_calls[0]["title"] == "fix: default args so the app stops crashing"
+    assert pr_calls[0]["head"].startswith("fix/issue-1-")
+    assert pr_calls[0]["base"] == "main"
+    assert pr_calls[0]["body"] == "## What\nAdds default CLI args.\n\n## Files\n- entrypoint.py"
 
 
 async def test_pr_opens_with_fallback_when_summary_fails() -> None:
@@ -435,7 +431,7 @@ async def test_pr_missing_tool_ends_with_error() -> None:
         model=FakeModel(MODEL_JSON, DESIGN_JSON), tools=tools, token="ght_test"
     )
     final = await graph.ainvoke(dict(ISSUE_INPUT))
-    assert final["applied_branch"] == "fix/issue-1"
+    assert final["applied_branch"].startswith("fix/issue-1-")
     assert final["pr_url"] is None
     assert final["events"][-1].kind == "error"
     assert final["events"][-1].detail.startswith("MCP create_pull_request tool not available")
@@ -458,7 +454,7 @@ async def test_full_run_uses_custom_base_branch() -> None:
         repo_full_name="octocat/Hello-World", kind="issue", number=9, base_branch="trunk"
     )
     final = await graph.ainvoke(dict(ISSUE_INPUT, target=target))
-    assert final["applied_branch"] == "fix/issue-9"
+    assert final["applied_branch"].startswith("fix/issue-9-")
     assert final["pr_url"] is not None
     assert branch_calls[0]["base_branch"] == "trunk"
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, cast
 
@@ -24,13 +25,21 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import SecretStr
 
-from agentos.agent.state import AgentState, ContextDoc, FileChange, Retriever, RunEvent
+from agentos.agent.state import (
+    AgentState,
+    ContextDoc,
+    FileChange,
+    Retriever,
+    RunEvent,
+    RunTarget,
+)
 from agentos.core.config import get_settings
 
 MAX_CONTEXT_FILES = 50
 MAX_FILE_CHARS = 10_000
 MAX_PROMPT_CONTEXT = 1_00_000
 MAX_RAG_CONTEXT = 50
+MAX_DESIGN_CONTEXT_FILES = 8
 _INVESTIGATE_PROMPT = """You are the investigation stage of a GitHub code-fix agent.
 You receive an issue/PR and some repository context. Determine what the problem
 is and where it likely comes from.
@@ -47,12 +56,26 @@ _DESIGN_PROMPT = """You are the design stage of a GitHub code-fix agent.
 Given the target, the investigation and the repo context, produce the exact
 file changes that fix the problem and nothing else.
 
-Return STRICT JSON: an ARRAY of change objects. Each object has:
-- "path": repository-relative file path (required)
-- "content": the FULL new file content (for edits and new files); ignored when
-  "delete" is true
-- "delete": optional boolean — true to delete the file (content must be "")
-- "explanation": one short sentence about why this change fixes the issue
+You are editing a real repository, so follow these rules exactly:
+
+1. MINIMAL SCOPE: change ONLY what the target issue/comments require. Do NOT
+   refactor, reformat, reorder imports, rename props, change labels, buttons,
+   styling, handlers or navigation unrelated to the issue. If something is not
+   asked for, leave it byte-for-byte identical.
+2. GROUND IN THE CURRENT FILE: you are given the full current content of each
+   file you may touch. Reproduce that content EXACTLY and apply the smallest
+   possible edit (a removed line, a commented-out block, an added guard). Never
+   rewrite a whole component when only a line or two must change.
+3. PRESERVE BEHAVIOR: never drop existing hooks/effects/state, imports used
+   elsewhere, or routes. If you must remove an import, ensure no remaining code
+   uses it. Prefer commenting out code over deleting it unless deletion is the
+   stated intent.
+4. Return STRICT JSON: an ARRAY of change objects. Each object has:
+   - "path": repository-relative file path (required)
+   - "content": the FULL new file content (for edits and new files); ignored when
+     "delete" is true
+   - "delete": optional boolean — true to delete the file (content must be "")
+   - "explanation": one short sentence about why this change fixes the issue
 
 Never truncate a file: "content" must always be the complete file.
 No prose outside the JSON array."""
@@ -72,12 +95,13 @@ No prose outside the JSON object."""
 
 
 def create_agent_llm() -> BaseChatModel:
-    """OpenRouter-bound chat model (``ChatOpenAI`` is OpenAI-compatible)."""
+    """OpenCode-bound chat model (``ChatOpenAI`` is OpenAI-compatible)."""
     settings = get_settings()
     return ChatOpenAI(
-        base_url=settings.openrouter_base_url,
-        api_key=SecretStr(settings.openrouter_api_key),
-        model=settings.openrouter_model,
+        base_url=settings.opencode_base_url,
+        api_key=SecretStr(settings.opencode_api_key),
+        model=settings.opencode_model,
+        max_tokens=settings.opencode_max_tokens,  # type: ignore[call-arg]  # pydantic field, stubs lag
     )
 
 
@@ -118,28 +142,65 @@ async def _fetch_target(tools: Sequence[BaseTool], state: AgentState) -> dict[st
     return payload
 
 
+_CONTEXT_MAX_DEPTH = 6  # depth 0 = repo root; each level descends one directory
+
+
 async def _gather_context(
     tools: Sequence[BaseTool], state: AgentState
 ) -> tuple[list[ContextDoc], int]:
-    """Read a couple of promising files from the repo root (bounded)."""
+    """Read promising files, descending into subdirectories (bounded).
+
+    Walks the file tree (up to ``_CONTEXT_MAX_DEPTH`` levels) and reads the
+    FULL content of the most relevant files so the model edits against the
+    true current source rather than a RAG snippet. Files that would be
+    truncated are skipped. Never raises: on tool failure it degrades to a
+    root listing (today's behavior).
+    """
     target = state["target"]
     owner, _, repo = target.repo_full_name.partition("/")
     listing_tool = _tool(tools, "list_repo_files")
     read_tool = _tool(tools, "read_file")
     if listing_tool is None or read_tool is None:
         return [], 0
-    listing = json.loads(await listing_tool.ainvoke({"owner": owner, "name": repo, "path": ""}))
-    entries = listing["items"] if isinstance(listing, dict) else listing
-    picked = [
-        entry["path"]
-        for entry in sorted(entries, key=lambda e: not bool(_PATCHABLE_NAME.match(e["name"])))
-        if entry.get("kind") == "file" and entry.get("size", 0) <= MAX_FILE_CHARS
-    ][:MAX_CONTEXT_FILES]
+
+    async def walk(path: str, depth: int) -> list[dict[str, Any]]:
+        try:
+            listing_raw = await listing_tool.ainvoke(
+                {"owner": owner, "name": repo, "path": path}
+            )
+        except Exception:
+            return []
+        listing = json.loads(listing_raw)
+        entries = listing["items"] if isinstance(listing, dict) else listing
+        found: list[dict[str, Any]] = []
+        for entry in entries:
+            kind = entry.get("kind")
+            if kind == "dir" and depth > 0:
+                found.extend(await walk(entry["path"], depth - 1))
+            elif (
+                kind == "file"
+                and entry.get("size", 0) <= MAX_FILE_CHARS
+            ):
+                found.append(entry)
+        return found
+
+    try:
+        entries = await walk("", _CONTEXT_MAX_DEPTH)
+    except Exception:
+        return [], 0
+    picked = sorted(
+        entries, key=lambda e: not bool(_PATCHABLE_NAME.match(e["name"] or ""))
+    )[:MAX_CONTEXT_FILES]
     docs: list[ContextDoc] = []
-    for path in picked:
-        content = await read_tool.ainvoke({"owner": owner, "name": repo, "path": path})
-        docs.append(ContextDoc(path=path, content=content))
-    return docs, len(picked)
+    for entry in picked:
+        try:
+            content = await read_tool.ainvoke(
+                {"owner": owner, "name": repo, "path": entry["path"]}
+            )
+        except Exception:
+            continue
+        docs.append(ContextDoc(path=entry["path"], content=content))
+    return docs, len(docs)
 
 
 async def _retrieve_context(
@@ -278,12 +339,130 @@ async def investigate_node(
     }
 
 
+_DESIGN_REPAIR_PROMPT = """You are the design stage of a GitHub code-fix agent,
+performing a minimal-edit verification pass.
+
+You previously proposed changes. For each file below you are given the EXACT
+current content from the repository. If your proposed change rewrites this file,
+re-emit it applying ONLY the minimal edit the issue requires: preserve every line
+not directly related to the fix byte-for-byte. Do NOT rename props, restyle,
+reorder imports, or drop hooks/effects/routes/handlers. If code must be hidden,
+comment it out in place rather than deleting, unless deletion is the issue's
+explicit intent. If the file did not change, return it unchanged.
+
+Return STRICT JSON: an ARRAY of change objects — the same shape as before
+(path, content, optional delete, explanation). No prose outside the JSON array."""
+
+
+async def _reproduce_minimal(
+    model: BaseChatModel,
+    tools: Sequence[BaseTool],
+    target: RunTarget,
+    changes: list[FileChange],
+    investigation: str,
+) -> tuple[list[FileChange], bool]:
+    """Re-read each to-be-touched file's full current content and let the model
+    re-emit a minimal, grounded edit (returns ``(changes, repaired)``)."""
+    read_tool = _tool(tools, "read_file")
+    if read_tool is None:
+        return changes, False
+    owner, _, repo = target.repo_full_name.partition("/")
+    need_fetch = [c for c in changes if not c.delete]
+    if not need_fetch:
+        return changes, False
+    blocks: list[str] = []
+    existed_paths: list[str] = []
+    for change in need_fetch[:10]:
+        try:
+            content = await read_tool.ainvoke(
+                {"owner": owner, "name": repo, "path": change.path}
+            )
+        except Exception:
+            continue  # new file or unreadable — leave as the model wrote it
+        existed_paths.append(change.path)
+        blocks.append(f"### {change.path}\n{content}")
+    if not existed_paths:
+        return changes, False
+    proposed = "\n\n".join(f"### {c.path}\n{c.content or '<deleted>'}" for c in changes)
+    prompt = (
+        f"Target: {target.repo_full_name} {target.kind} #{target.number}"
+        f" ({target.title or 'no title'})\n"
+        f"Investigation: {investigation or '(empty)'}\n\n"
+        f"CURRENT FILE CONTENT (from the repo, authoritative):\n"
+        + "\n\n".join(blocks)
+        + f"\n\nPREVIOUSLY PROPOSED CHANGES:\n{proposed}"
+    )[:MAX_PROMPT_CONTEXT]
+    try:
+        response = await model.ainvoke(
+            [SystemMessage(content=_DESIGN_REPAIR_PROMPT), HumanMessage(content=prompt)]
+        )
+        raw = _extract_json(str(response.content))
+        if not isinstance(raw, list):
+            return changes, False
+        fixed: list[FileChange] = []
+        repaired: dict[str, dict[str, Any]] = {}
+        for entry in raw:
+            if not isinstance(entry, dict) or not entry.get("path"):
+                continue
+            repaired[str(entry["path"])] = entry
+        for change in changes:
+            if not change.delete and change.path in repaired and change.path in existed_paths:
+                entry = repaired[change.path]
+                fixed.append(
+                    FileChange(
+                        path=str(entry.get("path")),
+                        content=str(entry.get("content") or ""),
+                        delete=bool(entry.get("delete", False)),
+                        explanation=str(entry.get("explanation") or ""),
+                    )
+                )
+            else:
+                fixed.append(change)
+        if fixed == changes:
+            return changes, False
+        return fixed, True
+    except Exception:
+        return changes, False
+
+
+def _design_relevant_context(state: AgentState) -> str:
+    """Pick the context docs most relevant to the fix for the design prompt.
+
+    The investigate stage may gather many files (e.g. ``MAX_CONTEXT_FILES``).
+    Feeding all of them to design overloads the model and degrades its output.
+    Order: docs whose path is explicitly named in the investigation first,
+    then ranked RAG chunks, then the rest — capped at
+    ``MAX_DESIGN_CONTEXT_FILES``.
+    """
+    docs = state["context"]
+    if not docs:
+        return "(no repo context was gathered)"
+    probe = f"{state['investigation'] or ''} {state['root_cause_hypothesis'] or ''}".lower()
+
+    def named(doc: ContextDoc) -> bool:
+        basename = doc.path.rsplit("/", 1)[-1]
+        stem = basename.rsplit(".", 1)[0].lower()
+        return stem in probe or basename.lower() in probe
+
+    named_docs = [doc for doc in docs if named(doc)]
+    rest = [doc for doc in docs if not named(doc)]
+    rest.sort(key=lambda doc: (doc.score is None, doc.score or 0.0), reverse=True)
+    picked = (named_docs + rest)[:MAX_DESIGN_CONTEXT_FILES]
+    return "\n\n".join(f"### {doc.path}\n{doc.content}" for doc in picked)
+
+
 async def design_node(
     state: AgentState,
     *,
     model: BaseChatModel | None,
+    tools: Sequence[BaseTool] = (),
 ) -> dict[str, Any]:
-    """Design the fix: ask the LLM for exact per-file changes (strict JSON)."""
+    """Design the fix: ask the LLM for exact per-file changes (strict JSON).
+
+    When ``tools`` are available, the proposed changes go through a repair
+    pass that re-reads each file's full current content and re-emits a
+    minimal, grounded edit (guards against whole-file rewrites).
+    """
     target = state["target"]
     events: list[RunEvent] = []
     if model is None:
@@ -292,10 +471,7 @@ async def design_node(
             "events": [RunEvent(stage="design", kind="design", detail="fix design pending")],
         }
 
-    context_block = (
-        "\n\n".join(f"### {doc.path}\n{doc.content}" for doc in state["context"])
-        or "(no repo context was gathered)"
-    )
+    context_block = _design_relevant_context(state)
     prompt = (
         f"Target: {target.repo_full_name} {target.kind} #{target.number}"
         f" ({target.title or 'no title'})\n"
@@ -328,6 +504,20 @@ async def design_node(
         events.append(RunEvent(stage="design", kind="error", detail=f"design failed: {exc}"))
         return {"proposed_changes": [], "events": events}
 
+    if tools and model is not None:
+        ground, repaired = await _reproduce_minimal(
+            model, tools, target, changes, state["investigation"] or ""
+        )
+        if repaired:
+            changes = ground
+            events.append(
+                RunEvent(
+                    stage="design",
+                    kind="design",
+                    detail="minimal-edit pass: re-grounded against current file(s)",
+                )
+            )
+
     paths = ", ".join(c.path for c in changes[:5])
     events.append(
         RunEvent(
@@ -337,6 +527,16 @@ async def design_node(
         )
     )
     return {"proposed_changes": changes, "events": events}
+
+
+def _branch_name(target: RunTarget, *, unique: bool) -> str:
+    """Deterministic logical branch name, optionally suffixed for uniqueness.
+
+    The suffix avoids collisions when the same issue is fixed more than once
+    (or by parallel runs), so ``create_branch`` doesn't 422 on an existing ref.
+    """
+    base = f"fix/{target.kind}-{target.number}"
+    return f"{base}-{int(time.time())}" if unique else base
 
 
 async def apply_node(
@@ -372,7 +572,7 @@ async def apply_node(
         return {"applied_branch": None, "events": events}
 
     owner, _, repo = target.repo_full_name.partition("/")
-    branch = f"fix/{target.kind}-{target.number}"
+    branch = _branch_name(target, unique=True)
     message = f"AgentOS: fix {target.kind} #{target.number}"
     if target.title:
         message = f"{message}: {target.title}"
@@ -530,11 +730,13 @@ def _investigate_with(
     return node
 
 
-def _design_with(model: BaseChatModel | None) -> Callable[[AgentState], Awaitable[dict[str, Any]]]:
-    """Closure binding the model into the design node."""
+def _design_with(
+    model: BaseChatModel | None, tools: Sequence[BaseTool]
+) -> Callable[[AgentState], Awaitable[dict[str, Any]]]:
+    """Closure binding model + tools into the design node."""
 
     async def node(state: AgentState) -> dict[str, Any]:
-        return await design_node(state, model=model)
+        return await design_node(state, model=model, tools=tools)
 
     return node
 
@@ -591,7 +793,7 @@ def create_agent_graph(
     pass_through = model is None and not tools and token is None
     builder = StateGraph(AgentState)
     builder.add_node("investigate", cast(Any, _investigate_with(model, tools, retrieval)))
-    builder.add_node("design", cast(Any, _design_with(model)))
+    builder.add_node("design", cast(Any, _design_with(model, tools)))
     builder.add_node("apply", cast(Any, _apply_with(tools, token)))
     builder.add_node("pr", cast(Any, _pr_with(model, tools, token)))
     builder.add_edge(START, "investigate")

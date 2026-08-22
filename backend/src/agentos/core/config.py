@@ -58,10 +58,17 @@ class Settings(BaseSettings):
     # --- OpenRouter ---
     openrouter_api_key: str = Field(init=False)
     openrouter_base_url: str = Field(init=False)
-    openrouter_model: str = Field(init=False)
     openrouter_embeddings_model: str = Field(init=False)
+
+    # --- OpenCode ---
+    opencode_api_key: str = Field(init=False)
+    opencode_base_url: str = Field(init=False)
+    opencode_model: str = Field(init=False)
+    opencode_judge_model: str = Field(init=False)
+
+    # --- Embeddings ---
+    opencode_max_tokens: int = Field(init=False)
     embeddings_dimensions: int = Field(init=False)
-    openrouter_judge_model: str = Field(init=False)
 
     # --- Rate limiting ---
     rate_limit_per_minute: int = Field(init=False)

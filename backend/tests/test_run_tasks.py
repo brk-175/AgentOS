@@ -90,7 +90,7 @@ async def test_execute_run_publishes_every_event_then_final() -> None:
     final = published[-1]
     assert final["type"] == "final"
     assert final["state"]["pr_url"] == "https://github.com/octocat/Hello-World/pull/42"
-    assert final["state"]["applied_branch"] == "fix/issue-1"
+    assert final["state"]["applied_branch"].startswith("fix/issue-1-")
     assert result["pr_url"] == "https://github.com/octocat/Hello-World/pull/42"
 
 
