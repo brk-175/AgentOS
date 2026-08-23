@@ -1,9 +1,9 @@
 "use client";
 
-import { History, Plus } from "lucide-react";
+import { History, Plus, RefreshCw } from "lucide-react";
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
-
+import { AppHeader } from "@/components/app-header";
 import { RunList, RunListError, RunListSkeleton } from "@/components/run-list";
 import { Button } from "@/components/ui/button";
 import { ApiError, getRuns, type RunRecord } from "@/lib/api";
@@ -34,7 +34,9 @@ export default function RunsPage() {
   }, [load]);
 
   return (
-    <div className="mx-auto max-w-5xl px-8 py-12">
+    <div className="min-h-screen bg-background text-foreground">
+      <AppHeader />
+      <main className="mx-auto max-w-6xl px-8 py-12">
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <h1 className="flex items-center gap-2 text-2xl font-semibold tracking-tight">
@@ -46,7 +48,8 @@ export default function RunsPage() {
           </p>
         </div>
         <div className="flex gap-2">
-          <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}>
+          <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading} className="cursor-pointer">
+            <RefreshCw className={`size-3.5 ${loading ? "animate-spin" : ""}`} />
             Refresh
           </Button>
           <Button size="sm" className="cursor-pointer">
@@ -73,6 +76,7 @@ export default function RunsPage() {
           <RunList runs={runs} />
         )}
       </div>
+      </main>
     </div>
   );
 }

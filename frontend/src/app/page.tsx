@@ -118,7 +118,7 @@ export default function LandingPage() {
           />
 
           <div className="relative mx-auto max-w-6xl px-6 pb-24 pt-24 text-center sm:pt-32">
-            <Badge variant="outline" className="mb-6 gap-1.5 rounded-full px-3 py-1 text-xs">
+            <Badge variant="outline" className="mb-6 gap-1.5 rounded-full px-3 py-3 text-xs">
               <Sparkles className="size-3" />
               From issue to pull request — automatically
             </Badge>
@@ -145,7 +145,7 @@ export default function LandingPage() {
 
         <section id="how-it-works" className="mx-auto max-w-6xl scroll-mt-20 px-6 py-20">
           <div className="mb-12 text-center">
-            <Badge variant="secondary" className="mb-3">
+            <Badge variant="secondary" className="mb-3 py-3">
               How it works
             </Badge>
             <h2 className="text-balance text-3xl font-semibold tracking-tight sm:text-4xl">
@@ -175,7 +175,7 @@ export default function LandingPage() {
         <section className="border-y bg-secondary/30">
           <div className="mx-auto max-w-6xl px-6 py-20">
             <div className="mb-12 text-center">
-              <Badge variant="secondary" className="mb-3">
+              <Badge variant="secondary" className="mb-3 py-3">
                 Built for engineering teams
               </Badge>
               <h2 className="text-balance text-3xl font-semibold tracking-tight sm:text-4xl">

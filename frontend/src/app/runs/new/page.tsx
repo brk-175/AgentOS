@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+import { AppHeader } from "@/components/app-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -99,7 +100,9 @@ export default function NewRunPage() {
   };
 
   return (
-    <div className="mx-auto max-w-2xl space-y-8 px-8 py-12">
+    <div className="min-h-screen bg-background text-foreground">
+      <AppHeader />
+      <main className="mx-auto max-w-2xl space-y-8 px-8 py-12">
       <div className="flex items-center justify-between gap-4">
         <Link
           href="/runs"
@@ -119,13 +122,13 @@ export default function NewRunPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Target</CardTitle>
-          <CardDescription>What should AgentOS fix?</CardDescription>
+          <CardTitle className="text-base ml-1">Target</CardTitle>
+          <CardDescription className="ml-1">What should AgentOS fix?</CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-5">
             <div className="space-y-2">
-              <label className="text-xs font-medium text-muted-foreground">Repository</label>
+              <label className="text-xs font-medium text-muted-foreground ml-1">Repository</label>
               {reposLoading ? (
                 <div className="space-y-2">
                   <Skeleton className="h-9 w-full" />
@@ -143,7 +146,7 @@ export default function NewRunPage() {
                 <select
                   value={repoFullName}
                   onChange={(event) => setRepoFullName(event.target.value)}
-                  className="h-9 w-full cursor-pointer rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                  className="h-9 w-full cursor-pointer rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 mt-1"
                 >
                   <option value="">Select a repository…</option>
                   {repos.map((repo) => (
@@ -154,7 +157,7 @@ export default function NewRunPage() {
                 </select>
               )}
               {selectedRepo && (
-                <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <p className="flex items-center gap-1.5 text-xs text-muted-foreground ml-1">
                   <FolderGit2 className="size-3" />
                   {selectedRepo.default_branch} · updated{" "}
                   {new Date(selectedRepo.updated_at).toLocaleDateString()}
@@ -163,7 +166,7 @@ export default function NewRunPage() {
             </div>
 
             <div className="space-y-2">
-              <label className="text-xs font-medium text-muted-foreground">Kind</label>
+              <label className="text-xs font-medium text-muted-foreground ml-1">Kind</label>
               <div className="flex gap-2">
                 {(["issue", "pr"] as RunKind[]).map((value) => (
                   <Button
@@ -171,7 +174,7 @@ export default function NewRunPage() {
                     type="button"
                     variant={kind === value ? "default" : "outline"}
                     size="sm"
-                    className="cursor-pointer capitalize"
+                    className="cursor-pointer capitalize mt-1 ml-1"
                     onClick={() => setKind(value)}
                   >
                     {value}
@@ -182,7 +185,7 @@ export default function NewRunPage() {
 
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <label className="text-xs font-medium text-muted-foreground">
+                <label className="text-xs font-medium text-muted-foreground ml-1">
                   {kind === "issue" ? "Issue number" : "PR number"}
                 </label>
                 <input
@@ -193,29 +196,29 @@ export default function NewRunPage() {
                   value={number}
                   onChange={(event) => setNumber(event.target.value)}
                   placeholder="e.g. 11"
-                  className="h-9 w-full rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                  className="h-9 w-full rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 mt-1"
                 />
               </div>
               <div className="space-y-2">
-                <label className="text-xs font-medium text-muted-foreground">Base branch</label>
+                <label className="text-xs font-medium text-muted-foreground ml-1">Base branch</label>
                 <input
                   value={baseBranch}
                   onChange={(event) => setBaseBranch(event.target.value)}
                   placeholder="main"
-                  className="h-9 w-full rounded-lg border bg-background px-3 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                  className="h-9 w-full rounded-lg border bg-background px-3 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 mt-1"
                 />
               </div>
             </div>
 
             <div className="space-y-2">
-              <label className="text-xs font-medium text-muted-foreground">
+              <label className="text-xs font-medium text-muted-foreground ml-1">
                 Title <span className="text-muted-foreground/50">(optional)</span>
               </label>
               <input
                 value={title}
                 onChange={(event) => setTitle(event.target.value)}
                 placeholder="Short description used for retrieval + commit message"
-                className="h-9 w-full rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                className="h-9 w-full rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 mt-1"
               />
             </div>
 
@@ -243,10 +246,11 @@ export default function NewRunPage() {
       </Card>
 
       {repos.length > 0 && !repoError && (
-        <Badge variant="outline" className="gap-1 text-xs">
+        <Badge variant="outline" className="gap-1 text-xs py-3">
           {repos.length} repositories available
         </Badge>
       )}
+      </main>
     </div>
   );
 }

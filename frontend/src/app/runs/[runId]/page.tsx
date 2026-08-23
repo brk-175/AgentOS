@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 
+import { AppHeader } from "@/components/app-header";
 import {
   EvaluationCard,
   EvaluationCardSkeleton,
@@ -56,8 +57,14 @@ export default function RunDetailPage() {
     return close;
   }, [run, runId, load]);
 
+  const status = run?.status ?? "unknown";
+  const evaluation = run?.state?.evaluation ?? null;
+  const changes = run?.state?.proposed_changes ?? [];
+  const events = (run?.events.length ?? 0) > 0 ? (run?.events ?? []) : liveEvents;
+
+  let content;
   if (error) {
-    return (
+    content = (
       <div className="mx-auto max-w-4xl px-8 py-12">
         <Link href="/runs" className="mb-6 inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground">
           <ArrowLeft className="size-3.5" />
@@ -68,24 +75,16 @@ export default function RunDetailPage() {
         </p>
       </div>
     );
-  }
-
-  if (!run) {
-    return (
+  } else if (!run) {
+    content = (
       <div className="mx-auto flex max-w-4xl items-center gap-2 px-8 py-24 text-sm text-muted-foreground">
         <Loader2 className="size-4 animate-spin" />
         Loading run…
       </div>
     );
-  }
-
-  const status = run.status;
-  const evaluation = run.state?.evaluation ?? null;
-  const changes = run.state?.proposed_changes ?? [];
-  const events = run.events.length > 0 ? run.events : liveEvents;
-
-  return (
-    <div className="mx-auto max-w-4xl space-y-6 px-8 py-12">
+  } else {
+    content = (
+      <main className="mx-auto max-w-7xl space-y-6 px-8 py-12">
       <div className="flex items-center justify-between gap-4">
         <Link href="/runs" className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground">
           <ArrowLeft className="size-3.5" />
@@ -205,6 +204,14 @@ export default function RunDetailPage() {
           )}
         </div>
       </div>
+      </main>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-background text-foreground">
+      <AppHeader />
+      {content}
     </div>
   );
 }
