@@ -113,7 +113,7 @@ async def execute_run(
             first_snapshot = False
         state = _compact_state(final)
         state["evaluation"] = await _evaluate(
-            run_id, target, final, judge=judge, publish=publish
+            run_id, target, final, judge=judge, publish=publish, tools=stream_tools
         )
         await publish({"run_id": run_id, "type": "final", "state": state})
         return state
@@ -131,6 +131,7 @@ async def _evaluate(
     *,
     judge: Any,
     publish: Callable[[dict[str, Any]], Awaitable[None]],
+    tools: Sequence[BaseTool] | None = None,
 ) -> dict[str, Any] | None:
     """Score the finished run with the judge model; degrade on any failure.
 
@@ -152,6 +153,7 @@ async def _evaluate(
             }
         )
         return None
+    current_files = await _gather_current_files(target, changes, tools)
     try:
         verdict = await evaluate_run(
             target,
@@ -161,6 +163,7 @@ async def _evaluate(
             applied_branch=final.get("applied_branch"),
             pr_url=final.get("pr_url"),
             judge=judge,
+            current_files=current_files,
         )
     except Exception as exc:  # noqa: BLE001 - evaluation must never kill the run
         logger.exception("judge evaluation for %s failed", target.repo_full_name)
@@ -185,6 +188,41 @@ async def _evaluate(
         }
     )
     return verdict.model_dump()
+
+
+async def _gather_current_files(
+    target: RunTarget,
+    changes: list[Any],
+    tools: Sequence[BaseTool] | None,
+) -> list[tuple[str, str]]:
+    """Best-effort fetch of the CURRENT content of each to-edit file.
+
+    Gives the judge the authoritative file text so it can apply the edit
+    pairs mentally and judge the RESULT (this is what prevents the
+    truncated-fragment hallucinations, e.g. "unclosed comment" panics on a
+    perfectly balanced surgical edit). Never raises.
+    """
+    if tools is None:
+        return []
+    owner, _, repo = target.repo_full_name.partition("/")
+    read_tool = next((tool for tool in tools if getattr(tool, "name", None) == "read_file"), None)
+    if read_tool is None:
+        return []
+    current: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for change in changes:
+        path = getattr(change, "path", None)
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        try:
+            content = await read_tool.ainvoke(
+                {"owner": owner, "name": repo, "path": str(path)}
+            )
+            current.append((str(path), content))
+        except Exception:  # noqa: BLE001 - grounding is best-effort
+            continue
+    return current
 
 
 @celery_app.task(name="agentos.run_fix_workflow")

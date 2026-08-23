@@ -13,6 +13,7 @@ success and raises only on hard judge failure (the caller degrades into an
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from typing import Any, Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -57,30 +58,60 @@ like a strict code reviewer and return STRICT JSON with exactly four keys:
 - "summary": 1-3 sentences for the human operator
 - "issues": array of concrete problems found (empty if none)
 
+HOW TO REVIEW (follow this algorithm exactly):
+
+1. EDITS ARE FIND-AND-REPLACE PAIRS. Each change with "edits" means: the
+   "FIND" block occurs EXACTLY once in the current file and is replaced
+   VERBATIM by the "REPLACE WITH" block. Do NOT read a fragment as the whole
+   file — a "FIND"/"REPLACE" piece may look unbalanced or incomplete in
+   isolation; that is normal for surgical edits.
+2. MENTALLY APPLY the pairs to the current content, then judge the RESULT:
+   is the resulting file valid, and does it satisfy the issue?
+3. Only flag a syntax/JSX/comment error if you can see it in the RESULT
+   after applying the pairs — never infer breakage from a truncated-looking
+   fragment.
+4. Missing-but-related housekeeping (e.g. an import that became unused after
+   removing the only usage) is a REAL but MINOR finding: lower correctness
+   by ~0.5, never crash it to 0 — the primary requirement was met.
+
 Scoring rules:
 - correctness: does the change actually resolve the issue's requirements?
+  Nearly-perfect resolution with one cosmetic leftover scores 4.5, not 0.
 - minimality: does it touch ONLY what the issue asked (no scope creep, no
   unrelated refactors/rewrites, no hallucinated files)?
 - behavior_preservation: does it keep unrelated behavior intact (habits,
   handlers, labels, imports still used elsewhere)?
 - grounding: is the change anchored in real repo content (paths that exist,
-  edits that match the current file), not invented structure?
+  edits whose FIND matches the current file), not invented structure?
 
-Be strict: a full-file rewrite when a 2-line edit would do scores low on
-minimality and behavior_preservation; a change to a path that does not exist
-in the repo fails grounding. No prose outside the JSON object."""
+Be strict but FAIR: a full-file rewrite when a 2-line edit would do scores low
+on minimality and behavior_preservation; a change to a path that does not
+exist in the repo fails grounding. No prose outside the JSON object."""
+
+
+_MAX_EDIT_CHARS = 4_000  # per FIND/REPLACE block — full surgical context
+
+
+def _clip(text: str, limit: int) -> str:
+    """Clip to ``limit`` chars WITHOUT cutting mid-way in a misleading spot."""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n...({len(text) - limit} chars omitted)"
 
 
 def _describe_change(change: FileChange) -> str:
+    builder = [f"### CHANGE: {change.path}"]
     if change.delete:
-        return f"- DELETE {change.path}"
-    if change.edits:
-        snippets = " | ".join(
-            f"{pair.before[:60]!r} -> {pair.after[:60]!r}" for pair in change.edits[:6]
-        )
-        return f"- EDIT {change.path}: {snippets}"
-    preview = change.content[:200].replace("\n", " ")
-    return f"- REPLACE {change.path}: {preview}…"
+        builder.append("ACTION: delete this file")
+    for index, pair in enumerate(change.edits):
+        builder.append(f"EDIT #{index + 1}")
+        builder.append(f"FIND (must occur exactly once):\n{_clip(pair.before, _MAX_EDIT_CHARS)}")
+        builder.append(f"REPLACE WITH:\n{_clip(pair.after, _MAX_EDIT_CHARS)}")
+    if change.content and not change.edits:
+        builder.append(f"FULL NEW FILE CONTENT:\n{_clip(change.content, _MAX_EDIT_CHARS)}")
+    if change.explanation:
+        builder.append(f"EXPLANATION: {change.explanation}")
+    return "\n".join(builder)
 
 
 def _build_prompt(
@@ -91,6 +122,7 @@ def _build_prompt(
     changes: list[FileChange],
     applied_branch: str | None,
     pr_url: str | None,
+    current_files: Sequence[tuple[str, str]] = (),
 ) -> str:
     lines = [
         f"Target: {target.repo_full_name} {target.kind} #{target.number}"
@@ -102,6 +134,10 @@ def _build_prompt(
         "Proposed changes:",
     ]
     lines.extend(_describe_change(change) for change in changes or [])
+    if current_files:
+        lines.append("\nCURRENT FILE CONTENT (authoritative — apply the edits to this):")
+        for path, content in current_files:
+            lines.append(f"### {path}\n{_clip(content, _MAX_EDIT_CHARS)}")
     return "\n".join(lines)[:_MAX_PROMPT_CHARS]
 
 
@@ -140,8 +176,14 @@ async def evaluate_run(
     applied_branch: str | None,
     pr_url: str | None,
     judge: Any,
+    current_files: Sequence[tuple[str, str]] = (),
 ) -> JudgeVerdict:
-    """Score a completed run with the judge model (raises on hard failure)."""
+    """Score a completed run with the judge model (raises on hard failure).
+
+    ``current_files`` carries the authoritative current content of the files
+    being edited (path, full content), so the judge can mentally apply the
+    find/replace pairs and judge the RESULT instead of isolated fragments.
+    """
     prompt = _build_prompt(
         target,
         investigation=investigation or "",
@@ -149,6 +191,7 @@ async def evaluate_run(
         changes=changes,
         applied_branch=applied_branch,
         pr_url=pr_url,
+        current_files=current_files,
     )
     response = await judge.ainvoke(
         [SystemMessage(content=_JUDGE_PROMPT), HumanMessage(content=prompt)]

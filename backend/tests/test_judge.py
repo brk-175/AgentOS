@@ -87,8 +87,35 @@ def test_build_prompt_includes_changes_and_target() -> None:
     )
     assert "App crashes on empty input" in prompt
     assert "entrypoint.py" in prompt
-    assert "DELETE old.py" in prompt
+    assert "ACTION: delete this file" in prompt
     assert "fix/issue-1-123" in prompt
+
+
+async def test_build_prompt_shows_full_find_replace_and_current_files() -> None:
+    before = "<Link className=\"text-sm font-medium hover:text-[#bbcb2e] transition-colors\" href=\"#\">\n            Reviewer\n          </Link>"
+    after = "          {/* <a className=\"text-sm font-medium hover:text-[#bbcb2e] transition-colors\" href=\"#\">\n            Documentation\n          </a> */}"
+    prompt = _build_prompt(
+        TARGET,
+        investigation="Remove futile tabs.",
+        hypothesis="Tabs live in Navbar.tsx.",
+        changes=[
+            FileChange(
+                path="web/src/app/components/Navbar.tsx",
+                edits=[{"before": before, "after": after}],
+                explanation="Comment out unused tabs.",
+            )
+        ],
+        applied_branch="fix/issue-1-1",
+        pr_url="http://pr",
+        current_files=[("web/src/app/components/Navbar.tsx", "full current file body")],
+    )
+    assert "FIND (must occur exactly once)" in prompt
+    assert "REPLACE WITH" in prompt
+    assert before in prompt  # never truncated
+    assert after in prompt  # never truncated
+    assert "EXPLANATION: Comment out unused tabs." in prompt
+    assert "CURRENT FILE CONTENT (authoritative" in prompt
+    assert "full current file body" in prompt
 
 
 async def test_evaluate_run_returns_verdict() -> None:
