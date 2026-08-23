@@ -2,20 +2,30 @@
 
 import { History, Plus, RefreshCw } from "lucide-react";
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+
+const MIN_REFRESH_VISIBLE_MS = 600; // keep the spinner on-screen this long
 import { AppHeader } from "@/components/app-header";
+import { ConnectGithub } from "@/components/connect-github";
 import { RunList, RunListError, RunListSkeleton } from "@/components/run-list";
 import { Button } from "@/components/ui/button";
-import { ApiError, getRuns, type RunRecord } from "@/lib/api";
+import { ApiError, getMe, getRuns, type RunRecord } from "@/lib/api";
+
+type ViewState = "loading" | "guest" | "ready";
 
 export default function RunsPage() {
+  const [view, setView] = useState<ViewState>("loading");
   const [runs, setRuns] = useState<RunRecord[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const loadingRef = useRef(false);
 
   const load = useCallback(async () => {
+    if (loadingRef.current) return; // ignore clicks while a refresh is in flight
+    loadingRef.current = true;
     setLoading(true);
     setError(null);
+    const started = Date.now();
     try {
       setRuns(await getRuns());
     } catch (err) {
@@ -25,13 +35,39 @@ export default function RunsPage() {
           : "Failed to load runs.",
       );
     } finally {
+      // Local API resolves in a few ms — keep the spinner perceivable for a
+      // minimum duration so the refresh feedback is visible every click.
+      const elapsed = Date.now() - started;
+      const remaining = Math.max(0, MIN_REFRESH_VISIBLE_MS - elapsed);
+      await new Promise((resolve) => setTimeout(resolve, remaining));
+      loadingRef.current = false;
       setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    void load();
+    let cancelled = false;
+    async function bootstrap() {
+      try {
+        await getMe();
+        if (cancelled) return;
+        setView("ready");
+        await load();
+      } catch {
+        if (cancelled) return;
+        setView("guest");
+      }
+    }
+    void bootstrap();
+    return () => {
+      cancelled = true;
+    };
   }, [load]);
+
+  // stale-while-revalidate: only the first load (no data yet) shows the
+  // skeleton; refreshes keep the current list visible so the page never jumps.
+  const refreshing = loading && runs.length > 0;
+  const firstLoad = loading && runs.length === 0;
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -60,22 +96,19 @@ export default function RunsPage() {
           </Button>
         </div>
       </div>
-      <div className="mt-8">
-        {error ? (
-          <>
+      {view === "guest" ? (
+        <ConnectGithub />
+      ) : (
+        <div className={`mt-8 transition-opacity duration-200 ${refreshing ? "pointer-events-none opacity-60" : "opacity-100"}`}>
+          {error ? (
             <RunListError detail={error} />
-            {error.startsWith("Sign in") && (
-              <Link href="/dashboard" className="mt-4 inline-block text-sm text-primary">
-                Go to dashboard
-              </Link>
-            )}
-          </>
-        ) : loading ? (
-          <RunListSkeleton />
-        ) : (
-          <RunList runs={runs} />
-        )}
-      </div>
+          ) : firstLoad ? (
+            <RunListSkeleton />
+          ) : (
+            <RunList runs={runs} />
+          )}
+        </div>
+      )}
       </main>
     </div>
   );

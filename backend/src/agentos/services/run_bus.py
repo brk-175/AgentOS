@@ -59,18 +59,30 @@ class RunStore:
     async def backlog(self, run_id: str) -> list[str]:
         return [str(item) for item in await self.redis.lrange(self.events_key(run_id), 0, -1)]
 
-    async def mark_queued(self, run_id: str) -> None:
+    async def mark_queued(self, run_id: str, target: dict[str, Any] | None = None) -> None:
         """Register a freshly-enqueued run so readers see ``queued``, not 404.
 
         The Celery worker's ``set_final`` later overwrites this marker with
         the terminal result; the marker shares the final key so the two never
-        coexist.
+        coexist. ``target`` is stored with the marker so the run-list can
+        render in-flight runs without a DB row yet.
         """
         await self.redis.set(
             self.final_key(run_id),
-            json.dumps({"status": "queued", "state": None, "detail": None}),
+            json.dumps(
+                {
+                    "status": "queued",
+                    "state": None,
+                    "detail": None,
+                    "target": target,
+                }
+            ),
             ex=RUN_TTL_SECONDS,
         )
+
+    async def active_run_ids(self, user_id: str | int) -> list[str]:
+        """Run ids currently queued/running for the user (concurrency guard set)."""
+        return [str(item) for item in await self.redis.smembers(self.active_key(user_id))]
 
     async def set_final(
         self, run_id: str, payload: dict[str, Any], user_id: str | int | None

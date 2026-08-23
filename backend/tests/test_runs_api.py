@@ -245,6 +245,33 @@ async def test_persist_run_roundtrip(db_factory: async_sessionmaker[AsyncSession
         assert await get_run_record(session, "missing") is None
 
 
+async def test_list_runs_includes_inflight_runs_first(
+    runs_env: tuple[httpx.AsyncClient, FakeRedis, list[tuple[str, Any]]],
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Regression: a queued/running run must show in the history without a DB row."""
+    client, fake, enqueued = runs_env
+    cookie = await seed_authenticated_user(db_factory, github_id=666, username="frank")
+    client.cookies.set("agentos_session", cookie)
+
+    response = await client.post(
+        f"{API_PREFIX}/runs",
+        json={"repo_full_name": "octocat/Hello-World", "kind": "issue", "number": 4},
+    )
+    assert response.status_code == 202
+    run_id = response.json()["run_id"]
+
+    history = await client.get(f"{API_PREFIX}/runs")
+    assert history.status_code == 200
+    rows = history.json()
+    assert len(rows) == 1
+    assert rows[0]["run_id"] == run_id
+    assert rows[0]["status"] == "queued"
+    assert rows[0]["repo_full_name"] == "octocat/Hello-World"
+    assert rows[0]["number"] == 4
+    assert rows[0]["evaluation"] is None
+
+
 async def test_list_runs_requires_auth(runs_env: tuple[httpx.AsyncClient, FakeRedis, list[tuple[str, Any]]]) -> None:
     client, _, _ = runs_env
     response = await client.get(f"{API_PREFIX}/runs")

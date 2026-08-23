@@ -104,6 +104,9 @@ class FakeRedis:
     async def scard(self, key: str) -> int:
         return len(self._sets.get(key, set()))
 
+    async def smembers(self, key: str) -> set[str]:
+        return set(self._sets.get(key, set()))
+
     async def expire(self, key: str, seconds: int) -> None:
         pass
 

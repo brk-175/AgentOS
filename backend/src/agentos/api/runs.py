@@ -70,10 +70,11 @@ async def start_run(
         raise HTTPException(status_code=429, detail="Concurrent run limit reached")
     run_id = uuid4().hex
     await store.add_active(user_id, run_id)
+    target = payload.model_dump()
     try:
-        enqueue_run(run_id, payload.model_dump(), auth.access_token, user_id)
+        enqueue_run(run_id, target, auth.access_token, user_id)
         # Readers must see "queued" (not 404) before the worker publishes anything.
-        await store.mark_queued(run_id)
+        await store.mark_queued(run_id, target)
     except Exception as exc:  # noqa: BLE001 - broker down; keep the client informed
         await store.set_final(
             run_id, {"status": "failed", "detail": f"enqueue failed: {exc}"}, user_id=None
@@ -94,12 +95,49 @@ async def _load_run_state(store: RunStore, run_id: str) -> tuple[dict[str, Any] 
 async def list_runs(
     auth: AuthContext,
     db: DbSession,
+    store: RunStoreDep,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    """Durable run history for the authenticated user (newest first)."""
+    """Run history for the authenticated user (newest first).
+
+    Merges live in-flight runs (queued/running, from Redis) on top of the
+    durable ``fix_runs`` records so the history page always reflects what is
+    currently happening — same freshness contract as the repo dashboard.
+    """
     if limit > 100:
         limit = 100
-    return await list_run_records(db, auth.user.id, limit=limit)
+
+    active: list[dict[str, Any]] = []
+    for run_id in await store.active_run_ids(str(auth.user.id)):
+        final = await store.get_final(run_id)
+        if final is None:
+            continue  # already completed and retired from the active set
+        status = str((final or {}).get("status", "running"))
+        if status in {"completed", "failed"}:
+            continue
+        target: dict[str, Any] = (final or {}).get("target") or {}
+        active.append(
+            {
+                "run_id": run_id,
+                "repo_full_name": target.get("repo_full_name", ""),
+                "kind": target.get("kind", "issue"),
+                "number": target.get("number"),
+                "title": target.get("title", ""),
+                "base_branch": target.get("base_branch", "main"),
+                "status": status,
+                "applied_branch": None,
+                "pr_url": None,
+                "investigation": "",
+                "root_cause_hypothesis": "",
+                "proposed_changes": [],
+                "evaluation": None,
+                "completed_at": None,
+            }
+        )
+
+    records = await list_run_records(db, auth.user.id, limit=limit - len(active))
+    # live runs are newest by definition; keep the overall cap
+    return (active + records)[:limit]
 
 
 @router.get("/{run_id}")
