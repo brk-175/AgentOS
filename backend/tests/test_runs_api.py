@@ -110,6 +110,30 @@ async def test_start_run_enqueues_and_marks_active(
     assert await fake.scard(f"agentos:users:{user_id}:active_runs") == 1
 
 
+async def test_newly_enqueued_run_is_visible_immediately(
+    runs_env: tuple[httpx.AsyncClient, FakeRedis, list[tuple[str, Any]]],
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Regression: a just-enqueued run must read back as ``queued`` (not 404)."""
+    client, _, _ = runs_env
+    cookie = await seed_authenticated_user(db_factory, github_id=555, username="erin")
+    client.cookies.set("agentos_session", cookie)
+
+    created = await client.post(
+        f"{API_PREFIX}/runs",
+        json={"repo_full_name": "octocat/Hello-World", "number": 9},
+    )
+    assert created.status_code == 202
+    run_id = created.json()["run_id"]
+
+    status = await client.get(f"{API_PREFIX}/runs/{run_id}")
+    assert status.status_code == 200
+    body = status.json()
+    assert body["status"] == "queued"
+    assert body["state"] is None
+    assert body["events"] == []
+
+
 async def test_start_run_rejects_above_concurrency(
     runs_env: tuple[httpx.AsyncClient, FakeRedis, list[tuple[str, Any]]],
     db_factory: async_sessionmaker[AsyncSession],

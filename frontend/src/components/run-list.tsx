@@ -1,9 +1,10 @@
 "use client";
 
-import { GitPullRequest, History, Loader2 } from "lucide-react";
+import { GitPullRequest, History, Loader2, Plus } from "lucide-react";
 import Link from "next/link";
 
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
@@ -47,9 +48,18 @@ export function RunList({ runs }: { runs: RunRecord[] }) {
         <CardHeader>
           <CardTitle className="text-base">No runs yet</CardTitle>
           <CardDescription>
-            Fix runs you start will appear here with the judge&apos;s verdict.
+            Start your first fix run — AgentOS investigates, fixes, opens a PR, and scores it
+            with the judge.
           </CardDescription>
         </CardHeader>
+        <CardContent>
+          <Link href="/runs/new">
+            <Button className="cursor-pointer">
+              <Plus className="size-3.5" />
+              New fix run
+            </Button>
+          </Link>
+        </CardContent>
       </Card>
     );
   }

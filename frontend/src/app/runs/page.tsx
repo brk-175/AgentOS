@@ -1,6 +1,6 @@
 "use client";
 
-import { History } from "lucide-react";
+import { History, Plus } from "lucide-react";
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 
@@ -45,9 +45,17 @@ export default function RunsPage() {
             Fix runs and their judge verdicts.
           </p>
         </div>
-        <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}>
-          Refresh
-        </Button>
+        <div className="flex gap-2">
+          <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}>
+            Refresh
+          </Button>
+          <Button size="sm" className="cursor-pointer">
+            <Link href="/runs/new" className="inline-flex items-center gap-1.5">
+              <Plus className="size-3.5" />
+              New fix run
+            </Link>
+          </Button>
+        </div>
       </div>
       <div className="mt-8">
         {error ? (

@@ -137,6 +137,45 @@ export function getRun(runId: string): Promise<RunDetail> {
   return getJSON<RunDetail>(`/api/v1/runs/${runId}`);
 }
 
+export type RunKind = "issue" | "pr";
+
+export interface StartRunRequest {
+  repo_full_name: string;
+  kind: RunKind;
+  number: number;
+  title?: string;
+  base_branch?: string;
+}
+
+export interface StartRunResponse {
+  run_id: string;
+  status: string;
+}
+
+export async function startRun(payload: StartRunRequest): Promise<StartRunResponse> {
+  const response = await fetch(`${API_URL}/api/v1/runs`, {
+    method: "POST",
+    credentials: "include",
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    let detail = response.statusText;
+    try {
+      const body = await response.json();
+      if (typeof body.detail === "string") {
+        detail = body.detail;
+      } else if (typeof body.detail === "object" && body.detail !== null) {
+        detail = JSON.stringify(body.detail);
+      }
+    } catch {
+      // non-JSON error body
+    }
+    throw new ApiError(response.status, detail);
+  }
+  return (await response.json()) as StartRunResponse;
+}
+
 /** Subscribe to a run's SSE event stream; returns a close() function. */
 export function subscribeRunEvents(
   runId: string,

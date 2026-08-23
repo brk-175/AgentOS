@@ -72,6 +72,8 @@ async def start_run(
     await store.add_active(user_id, run_id)
     try:
         enqueue_run(run_id, payload.model_dump(), auth.access_token, user_id)
+        # Readers must see "queued" (not 404) before the worker publishes anything.
+        await store.mark_queued(run_id)
     except Exception as exc:  # noqa: BLE001 - broker down; keep the client informed
         await store.set_final(
             run_id, {"status": "failed", "detail": f"enqueue failed: {exc}"}, user_id=None
