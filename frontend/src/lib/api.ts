@@ -112,6 +112,7 @@ export interface RunEvent {
   kind?: string;
   detail?: string;
   time?: string;
+  evaluation?: RunEvaluation | null;
 }
 
 export interface RunDetail {

@@ -181,6 +181,7 @@ async def _evaluate(
             "stage": "eval",
             "kind": "verdict",
             "detail": f"{verdict.verdict} (score {verdict.scores.model_dump()})",
+            "evaluation": verdict.model_dump(),
         }
     )
     return verdict.model_dump()
