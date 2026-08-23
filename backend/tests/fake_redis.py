@@ -32,7 +32,7 @@ class FakePipeline:
         return self
 
     async def __aexit__(self, *exc_info: Any) -> None:
-        await self.execute()
+        self._ops = []
 
     async def execute(self) -> None:
         ops, self._ops = self._ops, []

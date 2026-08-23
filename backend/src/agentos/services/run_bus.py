@@ -47,11 +47,14 @@ class RunStore:
         """Publish a payload to the run channel and append it to the backlog."""
         data = json.dumps(payload, default=str)
         events_key = self.events_key(run_id)
+        # NOTE: ``await pipe.execute()`` MUST stay inside the ``async with``
+        # body — redis-py's ``Pipeline.__aexit__`` calls ``reset()``, which
+        # silently discards any commands queued outside the executed window.
         async with self.redis.pipeline() as pipe:
             pipe.publish(self.channel(run_id), data)
             pipe.rpush(events_key, data)
             pipe.ltrim(events_key, -BACKLOG_LIMIT, -1)
-        await pipe.execute()
+            await pipe.execute()
 
     async def backlog(self, run_id: str) -> list[str]:
         return [str(item) for item in await self.redis.lrange(self.events_key(run_id), 0, -1)]

@@ -21,6 +21,18 @@ async def test_append_event_publishes_and_bounds_backlog() -> None:
     assert json.loads((await store.backlog(run_id))[0]) == {"type": "event", "index": 0}
 
 
+async def test_event_is_written_when_execute_is_inside_with_block() -> None:
+    """Regression: redis-py resets the pipeline on ``__aexit__``, so commands
+    queued outside an explicit ``execute()`` inside the ``with`` are dropped."""
+    fake = FakeRedis()
+    store = RunStore(fake)
+    await store.append_event("run-probe", {"type": "event", "stage": "probe"})
+    backlog = await store.backlog("run-probe")
+    assert len(backlog) == 1
+    assert json.loads(backlog[0]) == {"type": "event", "stage": "probe"}
+    assert f"agentos:runs:run-probe" in fake.published
+
+
 async def test_backlog_is_bounded() -> None:
     fake = FakeRedis()
     store = RunStore(fake)
