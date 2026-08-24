@@ -77,7 +77,9 @@ async def test_execute_run_publishes_every_event_then_final() -> None:
     assert published[0] == {"run_id": "run-1", "type": "start"}
     kinds = [item["kind"] for item in published if item["type"] == "event"]
     assert kinds == [
+        "loading",
         "target",
+        "loading",
         "context",
         "hypothesis",
         "design",
@@ -149,8 +151,11 @@ async def test_execute_run_with_retrieval_publishes_rag_event() -> None:
     )
     kinds = [item["kind"] for item in published if item["type"] == "event"]
     assert kinds == [
+        "loading",
         "target",
+        "loading",
         "rag",
+        "loading",
         "context",
         "hypothesis",
         "design",

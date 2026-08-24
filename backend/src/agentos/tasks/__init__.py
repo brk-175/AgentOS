@@ -20,9 +20,9 @@ import redis.asyncio as aioredis
 from celery import Celery
 from langchain_core.tools import BaseTool
 
-from agentos.agent.graph import create_agent_graph, create_agent_llm
+from agentos.agent.graph import create_agent_graph, create_agent_llm, set_event_sink
 from agentos.agent.mcp_adapter import GitHubMCPTools
-from agentos.agent.state import Retriever, RunTarget
+from agentos.agent.state import Retriever, RunEvent, RunTarget
 from agentos.core.config import get_settings
 from agentos.db.session import build_engine, build_session_factory
 from agentos.services.judge import create_judge_llm, evaluate_run
@@ -90,27 +90,39 @@ async def execute_run(
             retrieval=retrieval,
         )
         final: dict[str, Any] = {}
-        seen_events = 0
-        first_snapshot = True
-        async for snapshot in graph.astream(initial, stream_mode="values"):
-            final = snapshot
-            fresh = snapshot["events"][seen_events:]
-            if fresh:
+        published_times: set[str] = set()
+
+        async def live_sink(event: RunEvent) -> None:
+            """Fire every event the instant it is created (inside the nodes)."""
+            time_key = f"{event.time.isoformat()}-{event.stage}-{event.kind}"
+            if time_key in published_times:
+                return
+            published_times.add(time_key)
+            await publish(
+                {
+                    "run_id": run_id,
+                    "type": "event",
+                    "stage": event.stage,
+                    "kind": event.kind,
+                    "detail": event.detail,
+                    "time": event.time.isoformat(),
+                }
+            )
+
+        await publish({"run_id": run_id, "type": "start"})
+        set_event_sink(live_sink)
+        try:
+            seen_events = 0
+            async for snapshot in graph.astream(initial, stream_mode="values"):
+                final = snapshot
+                fresh = snapshot["events"][seen_events:]
                 for event in fresh:
-                    await publish(
-                        {
-                            "run_id": run_id,
-                            "type": "event",
-                            "stage": event.stage,
-                            "kind": event.kind,
-                            "detail": event.detail,
-                            "time": event.time.isoformat(),
-                        }
-                    )
+                    time_key = f"{event.time.isoformat()}-{event.stage}-{event.kind}"
+                    if time_key not in published_times:
+                        await live_sink(event)
                 seen_events = len(snapshot["events"])
-            elif first_snapshot:
-                await publish({"run_id": run_id, "type": "start"})
-            first_snapshot = False
+        finally:
+            set_event_sink(None)
         state = _compact_state(final)
         state["evaluation"] = await _evaluate(
             run_id, target, final, judge=judge, publish=publish, tools=stream_tools

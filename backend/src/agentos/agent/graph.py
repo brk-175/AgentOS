@@ -16,6 +16,7 @@ import json
 import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
+from contextvars import ContextVar
 from typing import Any, cast
 
 from langchain_core.language_models import BaseChatModel
@@ -34,6 +35,7 @@ from agentos.agent.state import (
     Retriever,
     RunEvent,
     RunTarget,
+    Stage,
 )
 from agentos.core.config import get_settings
 from agentos.services.rag import significant_keywords
@@ -54,6 +56,34 @@ Return STRICT JSON with exactly two keys:
 No prose outside the JSON object."""
 
 _PATCHABLE_NAME = re.compile(r"(?i)^(readme|contribut|license)")
+
+# Live event sink: set by ``execute_run`` (or tests) while the graph streams.
+# When set, every event is fired the moment it is created instead of waiting
+# for a node-boundary snapshot — this is what makes the run page update in
+# real time. When unset (plain graph runs / unit tests), events only land in
+# the accumulated state, exactly as before.
+_EventSink = Callable[[RunEvent], Awaitable[None]]
+_event_sink: ContextVar[_EventSink | None] = ContextVar("agentos_event_sink", default=None)
+
+
+def set_event_sink(sink: _EventSink | None) -> None:
+    """Bind an async sink that receives every event as it is created."""
+    _event_sink.set(sink)
+
+
+async def _emit(
+    events: list[RunEvent],
+    stage: Stage,
+    kind: str,
+    detail: str,
+) -> RunEvent:
+    """Record an event in state AND fire the live sink synchronously."""
+    event = RunEvent(stage=stage, kind=kind, detail=detail)
+    events.append(event)
+    sink = _event_sink.get()
+    if sink is not None:
+        await sink(event)
+    return event
 
 _DESIGN_PROMPT = """You are the design stage of a GitHub code-fix agent.
 Given the target, the investigation and the repo context, produce the exact
@@ -270,22 +300,24 @@ async def investigate_node(
     context_parts: list[str] = []
     context_docs: list[ContextDoc] = []
     files_read = 0
+
+    async def loading(detail: str) -> None:
+        await _emit(events, "investigate", "loading", detail)
+
     try:
+        await loading(f"{target.kind} #{target.number} loading…")
         details = await _fetch_target(tools, state)
-        events.append(
-            RunEvent(
-                stage="investigate",
-                kind="target",
-                detail=f"{target.kind} #{target.number} loaded: {details.get('title', '')[:80]}",
-            )
+        await _emit(
+            events,
+            "investigate",
+            "target",
+            f"{target.kind} #{target.number} loaded: {details.get('title', '')[:80]}",
         )
         context_parts.append(
             f"### {target.kind.upper()} #{target.number}\n{json.dumps(details, indent=2)[:6000]}"
         )
     except Exception as exc:
-        events.append(
-            RunEvent(stage="investigate", kind="error", detail=f"target fetch failed: {exc}")
-        )
+        await _emit(events, "investigate", "error", f"target fetch failed: {exc}")
         return {
             "investigation": f"Could not load {target.kind} #{target.number} of {target.repo_full_name}",
             "root_cause_hypothesis": "",
@@ -302,30 +334,27 @@ async def investigate_node(
     ) or f"{target.kind} #{target.number} in {target.repo_full_name}"
 
     if retrieval is not None:
+        await loading("searching repository context…")
         try:
             docs, detail = await _retrieve_context(retrieval, state, topic)
         except Exception as exc:
-            events.append(
-                RunEvent(stage="investigate", kind="rag", detail=f"retrieval failed: {exc}")
-            )
+            await _emit(events, "investigate", "rag", f"retrieval failed: {exc}")
         else:
-            events.append(
-                RunEvent(
-                    stage="investigate", kind="rag", detail=detail or "no relevant chunks found"
-                )
+            await _emit(
+                events,
+                "investigate",
+                "rag",
+                detail or "no relevant chunks found",
             )
             context_docs.extend(docs)
 
+    await loading("reading repository files…")
     try:
         context, files_read = await _gather_context(tools, state, topic)
     except Exception as exc:
-        events.append(
-            RunEvent(stage="investigate", kind="error", detail=f"context fetch failed: {exc}")
-        )
+        await _emit(events, "investigate", "error", f"context fetch failed: {exc}")
     if files_read:
-        events.append(
-            RunEvent(stage="investigate", kind="context", detail=f"read {files_read} file(s)")
-        )
+        await _emit(events, "investigate", "context", f"read {files_read} file(s)")
     context_docs.extend(context)
     context_parts.extend(_context_part(doc) for doc in context_docs)
 
@@ -352,7 +381,7 @@ async def investigate_node(
         if not investigation:
             raise ValueError("model returned an empty investigation")
     except Exception as exc:
-        events.append(RunEvent(stage="investigate", kind="error", detail=f"analysis failed: {exc}"))
+        await _emit(events, "investigate", "error", f"analysis failed: {exc}")
         return {
             "investigation": f"Analyzed {target.kind} #{target.number} of {target.repo_full_name}"
             + f": {details.get('title', '').strip()}",
@@ -360,9 +389,7 @@ async def investigate_node(
             "context": context_docs,
             "events": events,
         }
-    events.append(
-        RunEvent(stage="investigate", kind="hypothesis", detail=hypothesis[:140] or "no hypothesis")
-    )
+    await _emit(events, "investigate", "hypothesis", hypothesis[:140] or "no hypothesis")
     return {
         "investigation": investigation,
         "root_cause_hypothesis": hypothesis,
@@ -577,7 +604,7 @@ async def design_node(
         if not changes:
             raise ValueError("no valid change entries in model patch")
     except Exception as exc:
-        events.append(RunEvent(stage="design", kind="error", detail=f"design failed: {exc}"))
+        await _emit(events, "design", "error", f"design failed: {exc}")
         return {"proposed_changes": [], "events": events}
 
     if tools and model is not None:
@@ -586,42 +613,38 @@ async def design_node(
         )
         if ground is None:
             if not repaired:
-                events.append(
-                    RunEvent(
-                        stage="design",
-                        kind="error",
-                        detail="design aborted: could not read a target file to ground the edit",
-                    )
+                await _emit(
+                    events,
+                    "design",
+                    "error",
+                    "design aborted: could not read a target file to ground the edit",
                 )
             return {"proposed_changes": [], "events": events}
         if repaired:
             changes = ground
-            events.append(
-                RunEvent(
-                    stage="design",
-                    kind="design",
-                    detail="minimal-edit pass: re-grounded against current file(s)",
-                )
+            await _emit(
+                events,
+                "design",
+                "design",
+                "minimal-edit pass: re-grounded against current file(s)",
             )
 
     corrupt = _reject_corrupt_changes(changes)
     if corrupt:
-        events.append(
-            RunEvent(
-                stage="design",
-                kind="error",
-                detail=f"design rejected: placeholder/truncated content in {', '.join(corrupt)}",
-            )
+        await _emit(
+            events,
+            "design",
+            "error",
+            f"design rejected: placeholder/truncated content in {', '.join(corrupt)}",
         )
         return {"proposed_changes": [], "events": events}
 
     paths = ", ".join(c.path for c in changes[:5])
-    events.append(
-        RunEvent(
-            stage="design",
-            kind="design",
-            detail=f"{len(changes)} change(s): {paths}" + ("…" if len(changes) > 5 else ""),
-        )
+    await _emit(
+        events,
+        "design",
+        "design",
+        f"{len(changes)} change(s): {paths}" + ("…" if len(changes) > 5 else ""),
     )
     return {"proposed_changes": changes, "events": events}
 
@@ -675,20 +698,16 @@ async def apply_node(
             "events": [RunEvent(stage="apply", kind="apply", detail="changes not yet applied")],
         }
     if not changes:
-        events.append(
-            RunEvent(stage="apply", kind="error", detail="no changes to apply (design failed?)")
-        )
+        await _emit(events, "apply", "error", "no changes to apply (design failed?)")
         return {"applied_branch": None, "events": events}
     if token is None:
-        events.append(
-            RunEvent(stage="apply", kind="error", detail="GITHUB_TOKEN required to apply changes")
-        )
+        await _emit(events, "apply", "error", "GITHUB_TOKEN required to apply changes")
         return {"applied_branch": None, "events": events}
 
     branch_tool = _tool(tools, "create_branch")
     commit_tool = _tool(tools, "create_commit")
     if branch_tool is None or commit_tool is None:
-        events.append(RunEvent(stage="apply", kind="error", detail="MCP write tools not available"))
+        await _emit(events, "apply", "error", "MCP write tools not available")
         return {"applied_branch": None, "events": events}
 
     owner, _, repo = target.repo_full_name.partition("/")
@@ -711,13 +730,12 @@ async def apply_node(
                 }
             )
         )
-        events.append(
-            RunEvent(
-                stage="apply",
-                kind="branch",
-                detail=f"created {branch} from {target.base_branch} "
-                f"(sha {str(branch_result.get('sha', ''))[:8]})",
-            )
+        await _emit(
+            events,
+            "apply",
+            "branch",
+            f"created {branch} from {target.base_branch} "
+            f"(sha {str(branch_result.get('sha', ''))[:8]})",
         )
         commit_result = json.loads(
             await commit_tool.ainvoke(
@@ -730,15 +748,14 @@ async def apply_node(
                 }
             )
         )
-        events.append(
-            RunEvent(
-                stage="apply",
-                kind="commit",
-                detail=f"commit {str(commit_result.get('commit_sha', ''))[:12]}",
-            )
+        await _emit(
+            events,
+            "apply",
+            "commit",
+            f"commit {str(commit_result.get('commit_sha', ''))[:12]}",
         )
     except Exception as exc:
-        events.append(RunEvent(stage="apply", kind="error", detail=f"apply failed: {exc}"))
+        await _emit(events, "apply", "error", f"apply failed: {exc}")
         return {"applied_branch": None, "events": events}
     return {"applied_branch": branch, "events": events}
 
@@ -764,20 +781,14 @@ async def pr_node(
         }
     apply_branch = state["applied_branch"]
     if not apply_branch:
-        events.append(
-            RunEvent(stage="pr", kind="error", detail="no applied branch to open a PR from")
-        )
+        await _emit(events, "pr", "error", "no applied branch to open a PR from")
         return {"pr_url": None, "events": events}
     if token is None:
-        events.append(
-            RunEvent(stage="pr", kind="error", detail="GITHUB_TOKEN required to open a PR")
-        )
+        await _emit(events, "pr", "error", "GITHUB_TOKEN required to open a PR")
         return {"pr_url": None, "events": events}
     pr_tool = _tool(tools, "create_pull_request")
     if pr_tool is None:
-        events.append(
-            RunEvent(stage="pr", kind="error", detail="MCP create_pull_request tool not available")
-        )
+        await _emit(events, "pr", "error", "MCP create_pull_request tool not available")
         return {"pr_url": None, "events": events}
 
     changed = [
@@ -813,7 +824,7 @@ async def pr_node(
             title, body = llm_title[:72], llm_body
         except Exception:
             pass
-    events.append(RunEvent(stage="pr", kind="summary", detail=title))
+    await _emit(events, "pr", "summary", title)
 
     owner, _, repo = target.repo_full_name.partition("/")
     try:
@@ -832,9 +843,9 @@ async def pr_node(
         pr_url = str(result.get("url") or "")
         number = str(result.get("number") or "?")
     except Exception as exc:
-        events.append(RunEvent(stage="pr", kind="error", detail=f"pr failed: {exc}"))
+        await _emit(events, "pr", "error", f"pr failed: {exc}")
         return {"pr_url": None, "events": events}
-    events.append(RunEvent(stage="pr", kind="pr", detail=f"opened PR #{number}: {pr_url}"))
+    await _emit(events, "pr", "pr", f"opened PR #{number}: {pr_url}")
     return {"pr_url": pr_url, "events": events}
 
 
