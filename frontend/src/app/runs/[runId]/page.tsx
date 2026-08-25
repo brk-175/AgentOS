@@ -10,7 +10,6 @@ import {
   EvaluationCard,
   EvaluationCardSkeleton,
 } from "@/components/evaluation-card";
-import { Badge } from "@/components/ui/badge";
 import {
   Card,
   CardContent,
@@ -18,6 +17,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { ShimmerButton } from "@/components/ui/shimmer-button";
 import { ApiError, getRun, subscribeRunEvents, type RunDetail, type RunEvaluation, type RunEvent } from "@/lib/api";
 
 export default function RunDetailPage() {
@@ -70,6 +70,18 @@ export default function RunDetailPage() {
           if (event.evaluation) setLiveEvaluation(event.evaluation);
         }
         if (event.type === "final" || event.type === "error") {
+          // The terminal SSE payload carries the full compacted state — apply
+          // it immediately so Proposed Changes / PR URL appear without a reload
+          // (a follow-up load() would race the worker's Redis final marker).
+          if (event.type === "final" && event.state) {
+            setRun({
+              run_id: runId,
+              status: "completed",
+              state: event.state,
+              detail: null,
+              events: [],
+            });
+          }
           void load();
         }
       },
@@ -116,7 +128,7 @@ export default function RunDetailPage() {
           <ArrowLeft className="size-3.5" />
           Runs
         </Link>
-        <Badge>{status}</Badge>
+        <ShimmerButton shimmer={status !== "completed"}>{status}</ShimmerButton>
       </div>
 
       <div className="flex flex-wrap items-end justify-between gap-4">

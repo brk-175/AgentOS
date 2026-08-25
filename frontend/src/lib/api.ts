@@ -113,19 +113,22 @@ export interface RunEvent {
   detail?: string;
   time?: string;
   evaluation?: RunEvaluation | null;
+  state?: RunState | null;
+}
+
+export interface RunState {
+  investigation?: string | null;
+  root_cause_hypothesis?: string | null;
+  proposed_changes?: ProposedChange[];
+  applied_branch?: string | null;
+  pr_url?: string | null;
+  evaluation?: RunEvaluation | null;
 }
 
 export interface RunDetail {
   run_id: string;
   status: string;
-  state: {
-    investigation?: string | null;
-    root_cause_hypothesis?: string | null;
-    proposed_changes?: ProposedChange[];
-    applied_branch?: string | null;
-    pr_url?: string | null;
-    evaluation?: RunEvaluation | null;
-  } | null;
+  state: RunState | null;
   detail?: string | null;
   events: RunEvent[];
 }
