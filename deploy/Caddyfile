@@ -1,0 +1,8 @@
+api.agentos.gen.in {
+	encode gzip
+
+	reverse_proxy api:8000 {
+		# server-sent events: stream without buffering
+		flush_interval -1
+	}
+}

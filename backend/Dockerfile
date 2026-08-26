@@ -39,6 +39,10 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 USER appuser
 WORKDIR /home/appuser
 
+# Alembic migrations + config so `alembic upgrade head` can run from this image
+COPY --from=builder /src/backend/alembic /home/appuser/alembic
+COPY --from=builder /src/backend/alembic.ini /home/appuser/alembic.ini
+
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=5 \
     CMD celery -A agentos.tasks.celery_app inspect ping --timeout 5 || exit 1
 
