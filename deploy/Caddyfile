@@ -6,3 +6,9 @@ api.agentos.gen.in {
 		flush_interval -1
 	}
 }
+
+adminer.agentos.gen.in {
+	encode gzip
+
+	reverse_proxy adminer:8080
+}
