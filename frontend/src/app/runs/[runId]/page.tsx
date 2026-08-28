@@ -21,8 +21,20 @@ import {
 import { ShimmerButton } from "@/components/ui/shimmer-button";
 import { ApiError, getRun, subscribeRunEvents, type RunDetail, type RunEvaluation, type RunEvent } from "@/lib/api";
 
+// The same event arrives in two timestamp formats: the live SSE path
+// (``time.isoformat()`` → "+00:00") and the terminal payload
+// (pydantic ``model_dump(mode="json")`` → "Z"). Canonicalize both via Date
+// so dedupe sees one key per event — otherwise the final state merge would
+// re-append the whole timeline as "new" events.
+const normalizeTime = (value: string): string => {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toISOString();
+};
+
 const eventKey = (event: RunEvent) =>
-    event.time ?? `${event.type}-${event.stage}-${event.kind}`;
+  event.time
+    ? normalizeTime(event.time)
+    : `${event.type}-${event.stage}-${event.kind}`;
 
 export default function RunDetailPage() {
   const params = useParams<{ runId: string }>();
