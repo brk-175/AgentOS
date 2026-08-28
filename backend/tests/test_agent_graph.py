@@ -18,6 +18,7 @@ from agentos.agent.mcp_adapter import (
     json_schema_to_model,
 )
 from agentos.agent.state import ContextDoc, FileChange, RunTarget
+from agentos.services.rag import IndexSummary
 
 ISSUE_INPUT: dict[str, Any] = {
     "target": RunTarget(repo_full_name="octocat/Hello-World", kind="issue", number=1),
@@ -297,6 +298,65 @@ async def test_investigate_degrades_when_retrieval_fails() -> None:
     assert "### README.md" in prompt
 
 
+async def test_investigate_indexes_repo_when_retrieval_misses() -> None:
+    calls: list[tuple[str, str, int]] = []
+    indexed: list[str] = []
+    indexed_flag: list[bool] = [False]
+
+    async def fake_retrieve(repo: str, query: str, top_k: int) -> list[ContextDoc]:
+        calls.append((repo, query, top_k))
+        if indexed_flag[0]:
+            return [
+                ContextDoc(
+                    path="src/app.py",
+                    content="args = sys.argv or []  # null-safe entry",
+                    chunk_index=4,
+                    score=0.87,
+                )
+            ]
+        return []
+
+    async def fake_indexer(repo: str) -> IndexSummary:
+        indexed.append(repo)
+        indexed_flag[0] = True
+        return IndexSummary(
+            repo_full_name=repo, files_indexed=3, chunks=12, chars=1200, chunks_embedded=12
+        )
+
+    model = FakeModel(MODEL_JSON, "garbage")
+    graph = create_agent_graph(
+        model=model, tools=PLAIN_TOOLS, retrieval=fake_retrieve, indexer=fake_indexer
+    )
+    final = await graph.ainvoke(dict(ISSUE_INPUT))
+
+    assert indexed == ["octocat/Hello-World"]  # indexed once, before the re-query
+    assert len(calls) == 2  # first miss, then a hit after indexing
+    assert any(e.kind == "indexed" and e.detail.startswith("indexed 3 file(s)") for e in final["events"])
+    assert {doc.path for doc in final["context"]} >= {"src/app.py"}
+    prompt = next(m for m in model.calls[0] if isinstance(m, HumanMessage)).content
+    assert "args = sys.argv or []" in prompt
+
+
+async def test_investigate_degrades_when_auto_indexing_fails() -> None:
+    async def fake_retrieve(repo: str, query: str, top_k: int) -> list[ContextDoc]:
+        return []
+
+    async def broken_indexer(repo: str) -> IndexSummary:
+        raise RuntimeError("embedding api down")
+
+    graph = create_agent_graph(
+        model=FakeModel(MODEL_JSON, "garbage"),
+        tools=PLAIN_TOOLS,
+        retrieval=fake_retrieve,
+        indexer=broken_indexer,
+    )
+    final = await graph.ainvoke(dict(ISSUE_INPUT))
+    rag_detail = next(e.detail for e in final["events"] if e.kind == "rag")
+    assert rag_detail == "auto-indexing failed: embedding api down"
+    # still falls back to the raw file-read context path
+    assert any(e.kind == "context" and e.detail == "read 1 file(s)" for e in final["events"])
+
+
 async def test_design_produces_structured_changes() -> None:
     graph = create_agent_graph(model=FakeModel(MODEL_JSON, DESIGN_JSON), tools=PLAIN_TOOLS)
     final = await graph.ainvoke(dict(ISSUE_INPUT))
@@ -341,6 +401,30 @@ async def test_design_invalid_patch_falls_back() -> None:
     assert final["proposed_changes"] == []
     assert final["applied_branch"] is None
     assert "error" in [event.kind for event in final["events"]]
+
+
+async def test_design_retries_with_reduced_context_after_json_failure() -> None:
+    model = FakeModel(MODEL_JSON, "no JSON here", DESIGN_JSON)
+    graph = create_agent_graph(model=model, tools=PLAIN_TOOLS)
+    final = await graph.ainvoke(dict(ISSUE_INPUT))
+    assert final["proposed_changes"] == [
+        FileChange(
+            path="entrypoint.py",
+            content='def main():\n    args = sys.argv[1:] or ["default"]\n',
+            delete=False,
+            explanation="default arguments so the app no longer crashes",
+        ),
+        FileChange(
+            path="legacy.py", content="", delete=True, explanation="dead module removed"
+        ),
+    ]
+    design_errors = [e for e in final["events"] if e.stage == "design" and e.kind == "error"]
+    assert len(design_errors) == 1
+    assert "model output contained no JSON object or array" in design_errors[0].detail
+    assert any(
+        e.stage == "design" and e.detail == "retry succeeded with reduced context"
+        for e in final["events"]
+    )
 
 
 PR_JSON = json.dumps(

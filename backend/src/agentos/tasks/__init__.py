@@ -26,7 +26,7 @@ from agentos.agent.state import Retriever, RunEvent, RunTarget
 from agentos.core.config import get_settings
 from agentos.db.session import build_engine, build_session_factory
 from agentos.services.judge import create_judge_llm, evaluate_run
-from agentos.services.rag import build_retriever
+from agentos.services.rag import build_repository_indexer, build_retriever
 from agentos.services.run_bus import RunStore
 from agentos.services.run_records import persist_run
 
@@ -65,6 +65,7 @@ async def execute_run(
     model: Any = None,
     tools: Sequence[BaseTool] | None = None,
     retrieval: Retriever | None = None,
+    indexer: Callable[[str], Awaitable[Any]] | None = None,
     judge: Any = None,
 ) -> dict[str, Any]:
     """Run the fix-agent pipeline, publishing each fresh event as it happens.
@@ -88,6 +89,7 @@ async def execute_run(
             tools=stream_tools,
             token=access_token,
             retrieval=retrieval,
+            indexer=indexer,
         )
         final: dict[str, Any] = {}
         published_times: set[str] = set()
@@ -260,10 +262,12 @@ def run_fix_workflow(
             await store.append_event(run_id, payload)
 
         engine = None
+        indexer: Callable[[str], Awaitable[Any]] | None = None
         try:
             if access_token:
                 engine = build_engine(settings)
                 retrieval = build_retriever(engine)
+                indexer = build_repository_indexer(engine, access_token)
             else:
                 retrieval = None
             run_target = RunTarget.model_validate(target)
@@ -273,6 +277,7 @@ def run_fix_workflow(
                 access_token,
                 publish=publish,
                 retrieval=retrieval,
+                indexer=indexer,
                 judge=create_judge_llm(),
             )
             await store.set_final(run_id, {"status": "completed", "state": result}, user_id=user_id)

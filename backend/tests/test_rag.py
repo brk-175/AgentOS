@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from agentos.models.repository_document import RepositoryDocument
 from agentos.services.rag import (
     ContentFile,
+    build_repository_indexer,
     build_retriever,
     index_repository,
     search_repository,
@@ -275,3 +276,32 @@ async def test_build_retriever_maps_hits_to_context_docs(
     assert docs[0].chunk_index == 0
     assert docs[0].score == pytest.approx(1.0)
     assert await retrieve("octocat/demo", "zzz nothing indexed") == []
+
+
+async def test_build_repository_indexer_syncs_cold_repo(
+    db_engine: AsyncEngine,
+    db_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_fetch(
+        access_token: str, repo_full_name: str, *, max_files: int, max_chars: int
+    ) -> list[ContentFile]:
+        return [ContentFile(path="README.md", content="AgentOS fixes GitHub issues fast.")]
+
+    monkeypatch.setattr("agentos.services.rag._fetch_repo_files", fake_fetch)
+    embeddings = FakeEmbeddings()
+    indexer = build_repository_indexer(db_engine, "tok", embeddings=embeddings)
+
+    # cold repo → walked, chunked, embedded, stored
+    summary = await indexer("octocat/hello")
+    assert summary.files_indexed == 1
+    assert summary.chunks == 1
+    assert summary.chunks_embedded == 1
+    async with db_factory() as session:
+        assert await _count_documents(session, "octocat/hello") == 1
+
+    # re-indexing the unchanged repo embeds nothing (byte-identical chunks
+    # reuse their stored embeddings — cheap to retry)
+    summary = await indexer("octocat/hello")
+    assert summary.chunks_embedded == 0
+    assert len(embeddings.embedded_documents) == 1

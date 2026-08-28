@@ -38,7 +38,7 @@ from agentos.agent.state import (
     Stage,
 )
 from agentos.core.config import get_settings
-from agentos.services.rag import significant_keywords
+from agentos.services.rag import IndexSummary, significant_keywords
 
 MAX_CONTEXT_FILES = 50
 MAX_FILE_CHARS = 40_000
@@ -281,6 +281,7 @@ async def investigate_node(
     model: BaseChatModel | None,
     tools: Sequence[BaseTool],
     retrieval: Retriever | None = None,
+    indexer: Callable[[str], Awaitable[IndexSummary]] | None = None,
 ) -> dict[str, Any]:
     """Investigate the target: load it via MCP, gather context, LLM analysis."""
     target = state["target"]
@@ -337,6 +338,29 @@ async def investigate_node(
         await loading("searching repository context…")
         try:
             docs, detail = await _retrieve_context(retrieval, state, topic)
+            if not docs and indexer is not None:
+                # Cold or stale index: sync the repo chunks first, then
+                # re-query — a run must never die because embeddings were
+                # never generated (fresh DB) or the query just missed.
+                await loading("indexing repository…")
+                try:
+                    summary = await indexer(state["target"].repo_full_name)
+                except Exception as exc:
+                    await _emit(
+                        events,
+                        "investigate",
+                        "rag",
+                        f"auto-indexing failed: {exc}",
+                    )
+                else:
+                    await _emit(
+                        events,
+                        "investigate",
+                        "indexed",
+                        f"indexed {summary.files_indexed} file(s),"
+                        f" {summary.chunks} chunk(s)",
+                    )
+                    docs, detail = await _retrieve_context(retrieval, state, topic)
         except Exception as exc:
             await _emit(events, "investigate", "rag", f"retrieval failed: {exc}")
         else:
@@ -507,7 +531,9 @@ async def _reproduce_minimal(
         return changes, False
 
 
-def _design_relevant_context(state: AgentState) -> str:
+def _design_relevant_context(
+    state: AgentState, *, max_files: int = MAX_DESIGN_CONTEXT_FILES
+) -> str:
     """Pick the context docs most relevant to the fix for the design prompt.
 
     The investigate stage may gather many files (e.g. ``MAX_CONTEXT_FILES``)
@@ -543,7 +569,7 @@ def _design_relevant_context(state: AgentState) -> str:
     best_by_path: dict[str, ContextDoc] = {}
     for doc in ranked:
         best_by_path.setdefault(doc.path, doc)
-    picked = list(best_by_path.values())[:MAX_DESIGN_CONTEXT_FILES]
+    picked = list(best_by_path.values())[:max_files]
     return "\n\n".join(f"### {doc.path}\n{doc.content}" for doc in picked)
 
 
@@ -567,15 +593,17 @@ async def design_node(
             "events": [RunEvent(stage="design", kind="design", detail="fix design pending")],
         }
 
-    context_block = _design_relevant_context(state)
-    prompt = (
-        f"Target: {target.repo_full_name} {target.kind} #{target.number}"
-        f" ({target.title or 'no title'})\n"
-        f"Investigation: {state['investigation'] or '(empty)'}\n"
-        f"Root-cause hypothesis: {state['root_cause_hypothesis'] or '(none)'}\n\n"
-        f"Repo context:\n{context_block}"
-    )[:MAX_PROMPT_CONTEXT]
-    try:
+    async def loading(detail: str) -> None:
+        await _emit(events, "design", "loading", detail)
+
+    async def design_pass(block: str) -> list[FileChange]:
+        prompt = (
+            f"Target: {target.repo_full_name} {target.kind} #{target.number}"
+            f" ({target.title or 'no title'})\n"
+            f"Investigation: {state['investigation'] or '(empty)'}\n"
+            f"Root-cause hypothesis: {state['root_cause_hypothesis'] or '(none)'}\n\n"
+            f"Repo context:\n{block}"
+        )[:MAX_PROMPT_CONTEXT]
         response = await model.ainvoke(
             [SystemMessage(content=_DESIGN_PROMPT), HumanMessage(content=prompt)]
         )
@@ -603,9 +631,24 @@ async def design_node(
             )
         if not changes:
             raise ValueError("no valid change entries in model patch")
+        return changes
+
+    try:
+        changes = await design_pass(_design_relevant_context(state))
     except Exception as exc:
         await _emit(events, "design", "error", f"design failed: {exc}")
-        return {"proposed_changes": [], "events": events}
+        # Retry once with a slimmer context — over-stuffed prompts are the
+        # most common cause of a JSON-less response, so shrinking the files
+        # given to the model frequently lands a valid patch on the second pass.
+        await loading("design retrying with reduced context…")
+        try:
+            changes = await design_pass(
+                _design_relevant_context(state, max_files=MAX_DESIGN_CONTEXT_FILES // 2)
+            )
+        except Exception as exc2:
+            await _emit(events, "design", "error", f"design failed: {exc2}")
+            return {"proposed_changes": [], "events": events}
+        await _emit(events, "design", "design", "retry succeeded with reduced context")
 
     if tools and model is not None:
         ground, repaired = await _reproduce_minimal(
@@ -853,12 +896,13 @@ def _investigate_with(
     model: BaseChatModel | None,
     tools: Sequence[BaseTool],
     retrieval: Retriever | None = None,
+    indexer: Callable[[str], Awaitable[IndexSummary]] | None = None,
 ) -> Callable[[AgentState], Awaitable[dict[str, Any]]]:
     """Closure binding model+tools into the investigate node (LangGraph needs
     a real async callable — a sync wrapper returning a coroutine is not awaited)."""
 
     async def node(state: AgentState) -> dict[str, Any]:
-        return await investigate_node(state, model=model, tools=tools, retrieval=retrieval)
+        return await investigate_node(state, model=model, tools=tools, retrieval=retrieval, indexer=indexer)
 
     return node
 
@@ -913,6 +957,7 @@ def create_agent_graph(
     tools: Sequence[BaseTool] = (),
     token: str | None = None,
     retrieval: Retriever | None = None,
+    indexer: Callable[[str], Awaitable[IndexSummary]] | None = None,
 ) -> CompiledStateGraph:
     """Build and compile the fix-agent pipeline.
 
@@ -921,11 +966,15 @@ def create_agent_graph(
     model/tools/token the graph runs in deterministic stub mode (useful for
     tests/demo). ``retrieval`` — when provided — is queried during
     ``investigate`` for semantically relevant chunks; failures degrade
-    silently into today's file-only context.
+    silently into today's file-only context. ``indexer`` — when provided —
+    re-syncs the repository chunk index when retrieval comes up empty, then
+    ``investigate`` re-queries before falling back to raw file reads.
     """
     pass_through = model is None and not tools and token is None
     builder = StateGraph(AgentState)
-    builder.add_node("investigate", cast(Any, _investigate_with(model, tools, retrieval)))
+    builder.add_node(
+        "investigate", cast(Any, _investigate_with(model, tools, retrieval, indexer))
+    )
     builder.add_node("design", cast(Any, _design_with(model, tools)))
     builder.add_node("apply", cast(Any, _apply_with(tools, token)))
     builder.add_node("pr", cast(Any, _pr_with(model, tools, token)))

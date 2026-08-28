@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from math import sqrt
 from typing import Any
 
 from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from agentos.agent.mcp_adapter import GitHubMCPTools
@@ -188,7 +189,18 @@ async def index_repository(
                 )
         db.add_all(new_rows)
 
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # A concurrent indexer (parallel run) committed the same new rows —
+        # content is byte-identical, so the winner's embeddings are valid.
+        # Roll back this session's pending changes and treat the index as
+        # already-up-to-date rather than failing the whole run.
+        await db.rollback()
+        logger.warning(
+            "indexing %s raced a concurrent indexer; reusing the winner's rows",
+            repo_full_name,
+        )
     logger.info(
         "indexed %s: %d files, %d chunks (%d new/changed embedded, %d reused, %d stale removed)",
         repo_full_name,
@@ -345,3 +357,37 @@ def build_retriever(
         return docs
 
     return retrieve
+
+
+def build_repository_indexer(
+    engine: AsyncEngine,
+    access_token: str,
+    *,
+    embeddings: Any | None = None,
+    max_files: int = MAX_INDEX_FILES,
+    max_chars: int = MAX_INDEX_FILE_CHARS,
+) -> Callable[[str], Awaitable[IndexSummary]]:
+    """Bind an auto-index fallback for the agent's retrieval.
+
+    The returned callable re-syncs the chunk index for ``repo_full_name``
+    (walking the repo through the GitHub MCP tools, bounded) and returns the
+    ``IndexSummary``. Re-indexing an unchanged repo reuses stored embeddings,
+    so invoking it whenever retrieval comes up empty is cheap: the cost is
+    the file walk + reads, not embedding tokens. Used by ``investigate``
+    when the store is empty or the query misses — after indexing it re-queries
+    so a run never dies from a cold index.
+    """
+    factory = build_session_factory(engine)
+
+    async def index(repo_full_name: str) -> IndexSummary:
+        async with factory() as session:
+            return await index_repository(
+                session,
+                access_token,
+                repo_full_name,
+                embeddings=embeddings,
+                max_files=max_files,
+                max_chars=max_chars,
+            )
+
+    return index
