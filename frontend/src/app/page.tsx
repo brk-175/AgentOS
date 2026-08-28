@@ -36,14 +36,14 @@ const steps = [
   },
   {
     step: "02",
-    title: "Pick an issue or PR",
+    title: "Pick an Issue or PR",
     description:
       "Select the problem. AgentOS investigates it and retrieves the context that matters.",
     icon: FileSearch,
   },
   {
     step: "03",
-    title: "Review the pull request",
+    title: "Review the Pull Request",
     description:
       "AgentOS creates a branch, commits the fix, and opens a PR — with a full trace of how it got there.",
     icon: GitPullRequest,
@@ -89,7 +89,19 @@ const features = [
   },
 ];
 
-const stack = ["LangGraph", "MCP", "OpenRouter", "pgvector", "Kubernetes", "OpenTelemetry"];
+const stack = [
+  "Next.js",
+  "FastAPI",
+  "LangGraph",
+  "Celery",
+  "GitHub MCP",
+  "OpenCode",
+  "pgvector",
+  "Redis",
+  "PostgreSQL",
+  "Caddy",
+  "Docker",
+];
 
 export default function LandingPage() {
   return (
@@ -129,8 +141,8 @@ export default function LandingPage() {
               </span>
             </h1>
             <p className="mx-auto mt-6 max-w-2xl text-pretty text-base leading-7 text-muted-foreground sm:text-lg">
-              AgentOS connects to your GitHub repository, investigates an issue, retrieves the
-              relevant context, writes the fix, and opens a pull request — so your engineers
+              AgentOS connects to your GitHub repository, investigates an Issue or PR, retrieves the
+              relevant context, writes the fix, and opens a new pull request — so your engineers
               review the change instead of writing it from scratch.
             </p>
             <div className="mt-10 flex flex-col items-center justify-center gap-3 sm:flex-row">
