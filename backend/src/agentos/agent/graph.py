@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from contextvars import ContextVar
@@ -43,8 +42,6 @@ from agentos.services.rag import IndexSummary, significant_keywords
 
 logger = get_logger(__name__)
 
-MAX_CONTEXT_FILES = 50
-MAX_FILE_CHARS = 40_000
 MAX_PROMPT_CONTEXT = 1_00_000
 MAX_RAG_CONTEXT = 50
 MAX_DESIGN_CONTEXT_FILES = 8
@@ -57,8 +54,6 @@ Return STRICT JSON with exactly two keys:
 - "root_cause_hypothesis": the most likely root cause, naming files/line areas
 
 No prose outside the JSON object."""
-
-_PATCHABLE_NAME = re.compile(r"(?i)^(readme|contribut|license)")
 
 # Live event sink: set by ``execute_run`` (or tests) while the graph streams.
 # When set, every event is fired the moment it is created instead of waiting
@@ -195,78 +190,6 @@ async def _fetch_target(tools: Sequence[BaseTool], state: AgentState) -> dict[st
     return payload
 
 
-_CONTEXT_MAX_DEPTH = 6  # depth 0 = repo root; each level descends one directory
-
-
-async def _gather_context(
-    tools: Sequence[BaseTool],
-    state: AgentState,
-    topic: str = "",
-) -> tuple[list[ContextDoc], int]:
-    """Read promising files, descending into subdirectories (bounded).
-
-    Walks the file tree (up to ``_CONTEXT_MAX_DEPTH`` levels) and reads the
-    FULL content of the most relevant files so the model edits against the
-    true current source rather than a RAG snippet. Prioritizes files whose
-    name matches the issue topic (title + body keywords), then README-ish
-    files, then the rest (bounded by ``MAX_CONTEXT_FILES``). Never raises:
-    on tool failure it degrades to an empty context.
-    """
-    target = state["target"]
-    owner, _, repo = target.repo_full_name.partition("/")
-    listing_tool = _tool(tools, "list_repo_files")
-    read_tool = _tool(tools, "read_file")
-    if listing_tool is None or read_tool is None:
-        return [], 0
-
-    async def walk(path: str, depth: int) -> list[dict[str, Any]]:
-        try:
-            listing_raw = await listing_tool.ainvoke(
-                {"owner": owner, "name": repo, "path": path}
-            )
-        except Exception:
-            return []
-        listing = json.loads(listing_raw)
-        entries = listing["items"] if isinstance(listing, dict) else listing
-        found: list[dict[str, Any]] = []
-        for entry in entries:
-            kind = entry.get("kind")
-            if kind == "dir" and depth > 0:
-                found.extend(await walk(entry["path"], depth - 1))
-            elif kind == "file" and entry.get("size", 0) <= MAX_FILE_CHARS:
-                found.append(entry)
-        return found
-
-    topic_words = set(significant_keywords(topic, max_words=6))
-
-    def is_readme(entry: dict[str, Any]) -> bool:
-        return bool(_PATCHABLE_NAME.match(entry.get("name") or ""))
-
-    def is_topic_match(entry: dict[str, Any]) -> bool:
-        name = (entry.get("name") or "").lower()
-        stem = name.rsplit(".", 1)[0]
-        return any(word in name or word in stem for word in topic_words)
-
-    try:
-        entries = await walk("", _CONTEXT_MAX_DEPTH)
-    except Exception:
-        return [], 0
-    picked = sorted(
-        entries,
-        key=lambda e: (not is_topic_match(e), not is_readme(e)),
-    )[:MAX_CONTEXT_FILES]
-    docs: list[ContextDoc] = []
-    for entry in picked:
-        try:
-            content = await read_tool.ainvoke(
-                {"owner": owner, "name": repo, "path": entry["path"]}
-            )
-        except Exception:
-            continue
-        docs.append(ContextDoc(path=entry["path"], content=content))
-    return docs, len(docs)
-
-
 async def _retrieve_context(
     retrieval: Retriever, state: AgentState, topic: str
 ) -> tuple[list[ContextDoc], str]:
@@ -297,7 +220,12 @@ async def investigate_node(
     retrieval: Retriever | None = None,
     indexer: Callable[[str], Awaitable[IndexSummary]] | None = None,
 ) -> dict[str, Any]:
-    """Investigate the target: load it via MCP, gather context, LLM analysis."""
+    """Investigate the target: load it via MCP, gather RAG context, LLM analysis.
+
+    Repo context comes exclusively from semantic retrieval (chunks); when the
+    query misses, the injected ``indexer`` re-syncs the chunk index and the
+    query is retried before giving up on context.
+    """
     target = state["target"]
     events: list[RunEvent] = []
     if model is None and not tools:
@@ -314,7 +242,6 @@ async def investigate_node(
         }
     context_parts: list[str] = []
     context_docs: list[ContextDoc] = []
-    files_read = 0
 
     async def loading(detail: str) -> None:
         await _emit(events, "investigate", "loading", detail)
@@ -386,14 +313,6 @@ async def investigate_node(
             )
             context_docs.extend(docs)
 
-    await loading("reading repository files…")
-    try:
-        context, files_read = await _gather_context(tools, state, topic)
-    except Exception as exc:
-        await _emit(events, "investigate", "error", f"context fetch failed: {exc}")
-    if files_read:
-        await _emit(events, "investigate", "context", f"read {files_read} file(s)")
-    context_docs.extend(context)
     context_parts.extend(_context_part(doc) for doc in context_docs)
 
     if model is None:
@@ -550,9 +469,9 @@ def _design_relevant_context(
 ) -> str:
     """Pick the context docs most relevant to the fix for the design prompt.
 
-    The investigate stage may gather many files (e.g. ``MAX_CONTEXT_FILES``)
-    plus RAG/keyword chunks that duplicate paths. Feeding all of them to
-    design overloads the model and degrades its output. Ranking is per-file
+    The investigate stage gathers context from RAG retrieval (chunks, not
+    full files). Feeding every chunk to design overloads the model and
+    degrades its output. Ranking is per-file
     (one doc per path — the highest-ranked chunk): paths explicitly named in
     the investigation first, then docs whose *content* literally contains
     investigation keywords (e.g. a keyword-retrieved file like ``page.tsx``

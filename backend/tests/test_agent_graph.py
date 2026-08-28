@@ -293,9 +293,11 @@ async def test_investigate_degrades_when_retrieval_fails() -> None:
     assert final["root_cause_hypothesis"] == "missing null check in the entrypoint"
     rag_event = next(e for e in final["events"] if e.kind == "rag")
     assert rag_event.detail == "retrieval failed: db down"
+    # repo context is RAG-only now — nothing landed, so no repo content
+    assert final["context"] == []
     prompt = next(m for m in model.calls[0] if isinstance(m, HumanMessage)).content
     assert "def run():" not in prompt
-    assert "### README.md" in prompt
+    assert "README.md" not in prompt
 
 
 async def test_investigate_indexes_repo_when_retrieval_misses() -> None:
@@ -353,8 +355,9 @@ async def test_investigate_degrades_when_auto_indexing_fails() -> None:
     final = await graph.ainvoke(dict(ISSUE_INPUT))
     rag_detail = next(e.detail for e in final["events"] if e.kind == "rag")
     assert rag_detail == "auto-indexing failed: embedding api down"
-    # still falls back to the raw file-read context path
-    assert any(e.kind == "context" and e.detail == "read 1 file(s)" for e in final["events"])
+    # no repo context to fall back to — the run still produces an investigation
+    assert final["context"] == []
+    assert final["investigation"] == "App crashes when run without arguments."
 
 
 async def test_design_produces_structured_changes() -> None:

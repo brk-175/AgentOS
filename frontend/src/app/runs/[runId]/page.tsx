@@ -21,6 +21,9 @@ import {
 import { ShimmerButton } from "@/components/ui/shimmer-button";
 import { ApiError, getRun, subscribeRunEvents, type RunDetail, type RunEvaluation, type RunEvent } from "@/lib/api";
 
+const eventKey = (event: RunEvent) =>
+    event.time ?? `${event.type}-${event.stage}-${event.kind}`;
+
 export default function RunDetailPage() {
   const params = useParams<{ runId: string }>();
   const runId = params.runId;
@@ -32,21 +35,44 @@ export default function RunDetailPage() {
   const [liveStatus, setLiveStatus] = useState<string | null>(null);
   const [liveEvaluation, setLiveEvaluation] = useState<RunEvaluation | null>(null);
   const seenEventTimes = useRef<Set<string>>(new Set());
+  // Terminal state applied from the SSE payload. Once present it is the
+  // source of truth: any later fetch that still sees the queued marker (the
+  // worker writes it AFTER the final SSE broadcast) must NOT clobber it.
+  const terminalStateRef = useRef<RunDetail["state"] | null>(null);
+  const pollRef = useRef<number | null>(null);
+
+  // The timeline is append-only and idempotent: every event is keyed by
+  // time/stage/kind, so backlog replays (SSE reconnect, polls, terminal
+  // catch-up) are no-ops instead of duplicates.
+  const mergeEvents = useCallback((incoming: RunEvent[]) => {
+    const nextSeen = new Set(seenEventTimes.current);
+    const added = incoming.filter((candidate) => {
+      const key = eventKey(candidate);
+      if (nextSeen.has(key)) return false;
+      nextSeen.add(key);
+      return true;
+    });
+    if (added.length > 0) {
+      setLiveEvents((previous) => [...previous, ...added]);
+    }
+    seenEventTimes.current = nextSeen;
+  }, []);
 
   const load = useCallback(async () => {
     setError(null);
     try {
       const data = await getRun(runId);
+      mergeEvents(data.events ?? []);
+      if (terminalStateRef.current && (!data.state || data.status === "queued")) {
+        // The fetch raced the worker's Redis final marker — keep the state
+        // the terminal SSE payload already delivered.
+        return;
+      }
       setRun(data);
-      const backlog = data.events ?? [];
-      seenEventTimes.current = new Set(
-        backlog.map((event) => event.time ?? `${event.type}-${event.stage}-${event.kind}`),
-      );
-      setLiveEvents(backlog);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to load run.");
     }
-  }, [runId]);
+  }, [runId, mergeEvents]);
 
   useEffect(() => {
     void load();
@@ -59,10 +85,7 @@ export default function RunDetailPage() {
     const close = subscribeRunEvents(
       runId,
       (event) => {
-        const key = event.time ?? `${event.type}-${event.stage}-${event.kind}`;
-        if (seenEventTimes.current.has(key)) return;
-        seenEventTimes.current.add(key);
-        setLiveEvents((previous) => [...previous, event]);
+        mergeEvents([event]);
         // Realtime state from the stream: status transitions + the judge verdict.
         if (event.type === "start") setLiveStatus("running");
         if (event.type === "final") setLiveStatus("completed");
@@ -70,19 +93,16 @@ export default function RunDetailPage() {
         if (event.type === "event" && event.stage === "eval" && event.kind === "verdict") {
           if (event.evaluation) setLiveEvaluation(event.evaluation);
         }
-        if (event.type === "final" || event.type === "error") {
+        if (event.type === "final") {
           // The terminal SSE payload carries the full compacted state (fix
-          // details + PR info + the complete event timeline) — apply it
-          // immediately. A follow-up load() here would RACE the worker's
-          // Redis final marker and clobber the state with the stale queued
-          // snapshot; instead we seed the timeline from the payload itself
-          // and only fall back to a fetch for terminal stream errors.
-          if (event.type === "final" && event.state) {
-            const stateEvents = event.state.events ?? [];
-            seenEventTimes.current = new Set(
-              stateEvents.map((e) => e.time ?? `${e.type}-${e.stage}-${e.kind}`),
-            );
-            setLiveEvents(stateEvents);
+          // details + PR info + the complete event timeline). Apply it
+          // immediately; the timeline is already complete via live events —
+          // mergeEvents(state.events) only fills any gap. A follow-up load()
+          // here would RACE the worker's Redis final marker, so the state is
+          // remembered and, once the stream closes, polled instead.
+          if (event.state) {
+            terminalStateRef.current = event.state;
+            mergeEvents(event.state.events ?? []);
             setRun({
               run_id: runId,
               status: "completed",
@@ -93,12 +113,41 @@ export default function RunDetailPage() {
           } else {
             void load();
           }
+        } else if (event.type === "error") {
+          void load();
         }
       },
-      () => void load(),
+      () => {
+        if (terminalStateRef.current) return;
+        // Stream died before a terminal payload (e.g. the judge stage is the
+        // longest tail after the last live event) — poll until the worker
+        // writes the final marker, then stop.
+        void load();
+        if (pollRef.current !== null) return;
+        pollRef.current = window.setInterval(() => {
+          if (terminalStateRef.current) {
+            window.clearInterval(pollRef.current ?? 0);
+            pollRef.current = null;
+            return;
+          }
+          void load();
+        }, 3000);
+        window.setTimeout(() => {
+          if (pollRef.current !== null) {
+            window.clearInterval(pollRef.current);
+            pollRef.current = null;
+          }
+        }, 10 * 60 * 1000);
+      },
     );
-    return close;
-  }, [run, runId, load]);
+    return () => {
+      if (pollRef.current !== null) {
+        window.clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+      close();
+    };
+  }, [run, runId, load, mergeEvents]);
 
   // Realtime status: SSE wins over the (possibly stale) fetch snapshot.
   const status = liveStatus ?? run?.status ?? "unknown";
