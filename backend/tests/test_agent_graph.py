@@ -438,6 +438,26 @@ PR_TOOL = make_tool(
     PR_JSON,
 )
 
+# What the MCP server returns today: flattened string refs + author login
+# (not the raw GitHub API dict shape with base/head objects).
+RICH_PR_JSON = json.dumps(
+    {
+        "number": 42,
+        "url": "https://github.com/octocat/Hello-World/pull/42",
+        "title": "fix: default args so the app stops crashing",
+        "body": "## What\nAdds default CLI args.\n\n## Files\n- entrypoint.py",
+        "state": "open",
+        "draft": False,
+        "author": "octocat",
+        "created_at": "2026-08-28T00:36:10Z",
+        "base": "main",
+        "head": "fix/issue-1-1787877360",
+        "changed_files": 1,
+        "additions": 3,
+        "deletions": 1,
+    }
+)
+
 PR_SUMMARY_JSON = json.dumps(
     {
         "title": "fix: default args so the app stops crashing",
@@ -506,6 +526,38 @@ async def test_full_run_creates_branch_and_commit() -> None:
     assert pr_calls[0]["head"].startswith("fix/issue-1-")
     assert pr_calls[0]["base"] == "main"
     assert pr_calls[0]["body"] == "## What\nAdds default CLI args.\n\n## Files\n- entrypoint.py"
+
+
+async def test_pr_captures_flattened_metadata_without_raising() -> None:
+    tools = [
+        *PLAIN_TOOLS,
+        make_tool("create_branch", json.dumps({"sha": "ABC123"})),
+        make_tool("create_commit", json.dumps({"commit_sha": "c0ffee123456"})),
+        make_tool("create_pull_request", RICH_PR_JSON),
+    ]
+    graph = create_agent_graph(
+        model=FakeModel(MODEL_JSON, DESIGN_JSON, PR_SUMMARY_JSON),
+        tools=tools,
+        token="ght_test",
+    )
+    final = await graph.ainvoke(dict(ISSUE_INPUT))
+    # the run must complete — the PR is already open, metadata quirks
+    # (string base/head) must never fail the run after PR creation
+    assert final["pr_url"] == "https://github.com/octocat/Hello-World/pull/42"
+    assert final["pr"] == {
+        "number": "42",
+        "url": "https://github.com/octocat/Hello-World/pull/42",
+        "title": "fix: default args so the app stops crashing",
+        "body": "## What\nAdds default CLI args.\n\n## Files\n- entrypoint.py",
+        "state": "open",
+        "author": "octocat",
+        "created_at": "2026-08-28T00:36:10Z",
+        "base": "main",
+        "head": "fix/issue-1-1787877360",
+        "changed_files": 1,
+        "additions": 3,
+        "deletions": 1,
+    }
 
 
 async def test_pr_opens_with_fallback_when_summary_fails() -> None:

@@ -52,6 +52,7 @@ def _compact_state(state: dict[str, Any]) -> dict[str, Any]:
         "proposed_changes": [change.model_dump() for change in state.get("proposed_changes") or []],
         "applied_branch": state.get("applied_branch"),
         "pr_url": state.get("pr_url"),
+        "pr": state.get("pr"),
         "events": [event.model_dump(mode="json") for event in state.get("events") or []],
     }
 

@@ -319,7 +319,8 @@ async def create_pull_request(
 ) -> dict[str, Any]:
     """Open a pull request from ``head`` into ``base`` in ``owner/name``.
 
-    Returns the PR number and its HTML URL for human review. The ``head``
+    Returns the created PR (number, HTML URL, title, body, state, author,
+    timestamps, base/head refs, diff stats) for human review. The ``head``
     branch must exist and differ from ``base``.
     """
     _require_token()
@@ -330,7 +331,21 @@ async def create_pull_request(
             json={"title": title, "head": head, "base": base, "body": body},
         )
         payload = _json_or_raise(response)
-    return {"number": payload["number"], "url": payload["html_url"]}
+    return {
+        "number": payload["number"],
+        "url": payload["html_url"],
+        "title": payload.get("title"),
+        "body": payload.get("body"),
+        "state": payload.get("state"),
+        "draft": payload.get("draft"),
+        "author": (payload.get("user") or {}).get("login"),
+        "created_at": payload.get("created_at"),
+        "base": (payload.get("base") or {}).get("ref"),
+        "head": (payload.get("head") or {}).get("ref"),
+        "changed_files": payload.get("changed_files"),
+        "additions": payload.get("additions"),
+        "deletions": payload.get("deletions"),
+    }
 
 
 def main() -> None:

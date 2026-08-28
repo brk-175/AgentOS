@@ -122,7 +122,24 @@ export interface RunState {
   proposed_changes?: ProposedChange[];
   applied_branch?: string | null;
   pr_url?: string | null;
+  pr?: RunPullRequest | null;
   evaluation?: RunEvaluation | null;
+  events?: RunEvent[];
+}
+
+export interface RunPullRequest {
+  number: number | string;
+  url: string;
+  title?: string | null;
+  body?: string | null;
+  state?: string | null;
+  author?: string | null;
+  created_at?: string | null;
+  base?: string | null;
+  head?: string | null;
+  changed_files?: number | null;
+  additions?: number | null;
+  deletions?: number | null;
 }
 
 export interface RunDetail {

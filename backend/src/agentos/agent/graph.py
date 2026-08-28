@@ -38,7 +38,10 @@ from agentos.agent.state import (
     Stage,
 )
 from agentos.core.config import get_settings
+from agentos.core.logging import get_logger
 from agentos.services.rag import IndexSummary, significant_keywords
+
+logger = get_logger(__name__)
 
 MAX_CONTEXT_FILES = 50
 MAX_FILE_CHARS = 40_000
@@ -165,6 +168,17 @@ def _extract_json(text: str) -> Any:
 
 def _tool(tools: Sequence[BaseTool], name: str) -> BaseTool | None:
     return next((tool for tool in tools if tool.name == name), None)
+
+
+def _pr_ref(value: Any) -> str | None:
+    """Extract a branch ref from a PR payload — GitHub API dict (``{"ref": ...}``)
+    or the MCP server's flattened string form; anything else is ``None``."""
+    if isinstance(value, dict):
+        ref = value.get("ref") or value.get("name")
+        return str(ref) if ref else None
+    if isinstance(value, str) and value:
+        return value
+    return None
 
 
 async def _fetch_target(tools: Sequence[BaseTool], state: AgentState) -> dict[str, Any]:
@@ -888,8 +902,35 @@ async def pr_node(
     except Exception as exc:
         await _emit(events, "pr", "error", f"pr failed: {exc}")
         return {"pr_url": None, "events": events}
+
+    # The PR is already open — metadata must never take the run down with it.
+    # Payload shape varies (raw GitHub API vs the MCP server's flattened view),
+    # so build the display dict defensively and degrade to a minimal card.
+    try:
+        author = result.get("author")
+        if author is None and isinstance(result.get("user"), dict):
+            author = result["user"].get("login")
+        pr = {
+            "number": number,
+            "url": pr_url,
+            "title": str(result.get("title") or title),
+            "body": str(result.get("body") or body),
+            "state": str(result.get("state") or "open"),
+            "author": str(author) if author is not None else None,
+            "created_at": str(result.get("created_at") or ""),
+            "base": _pr_ref(result.get("base")),
+            "head": _pr_ref(result.get("head")),
+            "changed_files": result.get("changed_files"),
+            "additions": result.get("additions"),
+            "deletions": result.get("deletions"),
+        }
+    except Exception as exc:
+        logger.warning("pr metadata mapping failed for %s: %s", pr_url, exc)
+        await _emit(events, "pr", "error", f"pr metadata mapping failed (PR is open): {exc}")
+        pr = {"number": number, "url": pr_url, "title": title, "body": body}
+
     await _emit(events, "pr", "pr", f"opened PR #{number}: {pr_url}")
-    return {"pr_url": pr_url, "events": events}
+    return {"pr_url": pr_url, "pr": pr, "events": events}
 
 
 def _investigate_with(

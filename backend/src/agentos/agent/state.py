@@ -11,7 +11,7 @@ from __future__ import annotations
 import operator
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import Annotated, Literal, TypedDict
+from typing import Annotated, Any, Literal, NotRequired, TypedDict
 
 from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
@@ -95,3 +95,4 @@ class AgentState(TypedDict):
     proposed_changes: list[FileChange]
     applied_branch: str | None
     pr_url: str | None
+    pr: NotRequired[dict[str, Any] | None]

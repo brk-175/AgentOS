@@ -10,6 +10,7 @@ import {
   EvaluationCard,
   EvaluationCardSkeleton,
 } from "@/components/evaluation-card";
+import { PullRequestCard } from "@/components/pull-request-card";
 import {
   Card,
   CardContent,
@@ -70,10 +71,18 @@ export default function RunDetailPage() {
           if (event.evaluation) setLiveEvaluation(event.evaluation);
         }
         if (event.type === "final" || event.type === "error") {
-          // The terminal SSE payload carries the full compacted state — apply
-          // it immediately so Proposed Changes / PR URL appear without a reload
-          // (a follow-up load() would race the worker's Redis final marker).
+          // The terminal SSE payload carries the full compacted state (fix
+          // details + PR info + the complete event timeline) — apply it
+          // immediately. A follow-up load() here would RACE the worker's
+          // Redis final marker and clobber the state with the stale queued
+          // snapshot; instead we seed the timeline from the payload itself
+          // and only fall back to a fetch for terminal stream errors.
           if (event.type === "final" && event.state) {
+            const stateEvents = event.state.events ?? [];
+            seenEventTimes.current = new Set(
+              stateEvents.map((e) => e.time ?? `${e.type}-${e.stage}-${e.kind}`),
+            );
+            setLiveEvents(stateEvents);
             setRun({
               run_id: runId,
               status: "completed",
@@ -81,8 +90,9 @@ export default function RunDetailPage() {
               detail: null,
               events: [],
             });
+          } else {
+            void load();
           }
-          void load();
         }
       },
       () => void load(),
@@ -237,7 +247,7 @@ export default function RunDetailPage() {
           )}
         </div>
 
-        <div>
+        <div className="space-y-6">
           {evaluation ? (
             <EvaluationCard evaluation={evaluation} />
           ) : status === "running" || status === "queued" ? (
@@ -250,6 +260,11 @@ export default function RunDetailPage() {
               </CardHeader>
             </Card>
           )}
+          {run.state?.pr ? (
+            <PullRequestCard pr={run.state.pr} />
+          ) : run.state?.pr_url ? (
+            <PullRequestCard fallbackUrl={run.state.pr_url} />
+          ) : null}
         </div>
       </div>
       </main>
