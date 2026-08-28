@@ -8,7 +8,7 @@ indexing lands (Stage 4).
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -78,6 +78,32 @@ async def fetch_repo(
     except github.GitHubClientError as exc:
         raise _map_error(exc) from exc
     return RepositoryOut.model_validate(asdict(repo))
+
+
+class TargetOut(BaseModel):
+    """One issue or pull request for the new-run picker."""
+
+    kind: Literal["issue", "pr"]
+    number: int
+    title: str
+    state: str
+    created_at: str
+    updated_at: str
+    merged_at: str | None = None
+
+
+@router.get("/{full_name:path}/targets", response_model=list[TargetOut])
+async def list_targets(
+    auth: AuthContext,
+    full_name: str,
+    kind: Literal["issue", "pr"] = Query(default="issue", description="Target kind"),
+) -> list[TargetOut]:
+    """List the repo's issues or pull requests, newest first (paginated)."""
+    try:
+        targets = await github.list_issue_pulls(auth.access_token, full_name, kind)
+    except github.GitHubClientError as exc:
+        raise _map_error(exc) from exc
+    return [TargetOut.model_validate(asdict(target)) for target in targets]
 
 
 class IndexOut(BaseModel):

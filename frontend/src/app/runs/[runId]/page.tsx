@@ -138,7 +138,11 @@ export default function RunDetailPage() {
           <ArrowLeft className="size-3.5" />
           Runs
         </Link>
-        <ShimmerButton shimmer={status !== "completed"}>{status}</ShimmerButton>
+        <ShimmerButton
+          shimmer={status === "running" || status === "queued"}
+        >
+          {status}
+        </ShimmerButton>
       </div>
 
       <div className="flex flex-wrap items-end justify-between gap-4">

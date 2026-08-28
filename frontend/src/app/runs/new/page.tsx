@@ -19,8 +19,10 @@ import { Skeleton } from "@/components/ui/skeleton";
 import {
   ApiError,
   getRepos,
+  getTargets,
   startRun,
   type Repo,
+  type RepoTarget,
   type RunKind,
 } from "@/lib/api";
 
@@ -32,9 +34,15 @@ export default function NewRunPage() {
 
   const [repoFullName, setRepoFullName] = useState("");
   const [kind, setKind] = useState<RunKind>("issue");
-  const [number, setNumber] = useState("");
+  const [targetNumber, setTargetNumber] = useState("");
   const [title, setTitle] = useState("");
   const [baseBranch, setBaseBranch] = useState("main");
+  const [targetsByKind, setTargetsByKind] = useState<{
+    issue: RepoTarget[];
+    pr: RepoTarget[];
+  }>({ issue: [], pr: [] });
+  const [targetsLoading, setTargetsLoading] = useState(false);
+  const [targetError, setTargetError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -43,15 +51,12 @@ export default function NewRunPage() {
     setRepoError(null);
     try {
       setRepos(await getRepos());
-      if (!repoFullName && repos.length === 0) {
-        // defer: set after load in effect
-      }
     } catch (err) {
       setRepoError(err instanceof ApiError ? err.message : "Failed to load repositories");
     } finally {
       setReposLoading(false);
     }
-  }, [repoFullName, repos.length]);
+  }, []);
 
   useEffect(() => {
     void loadRepos();
@@ -63,27 +68,70 @@ export default function NewRunPage() {
     [repos, repoFullName],
   );
 
-  const numberValue = number.trim() === "" ? null : Number(number);
+  // Both kinds are fetched together when a repo is selected, so switching
+  // kind later is instant — the dropdown just filters the cached lists.
+  const loadTargets = useCallback(async (repo: string) => {
+    if (!repo) return;
+    setTargetsLoading(true);
+    setTargetError(null);
+    try {
+      const [issues, pulls] = await Promise.all([
+        getTargets(repo, "issue"),
+        getTargets(repo, "pr"),
+      ]);
+      setTargetsByKind({ issue: issues, pr: pulls });
+    } catch (err) {
+      setTargetError(err instanceof ApiError ? err.message : "Failed to load issues and PRs");
+      setTargetsByKind({ issue: [], pr: [] });
+    } finally {
+      setTargetsLoading(false);
+    }
+  }, []);
+
+  const handleRepoChange = (value: string) => {
+    setRepoFullName(value);
+    setTargetNumber("");
+    setTitle("");
+    const repo = repos.find((candidate) => candidate.full_name === value);
+    setBaseBranch(repo?.default_branch ?? "main");
+    void loadTargets(value);
+  };
+
+  const handleKindChange = (value: RunKind) => {
+    setKind(value);
+    setTargetNumber("");
+  };
+
+  const targetOptions = targetsByKind[kind];
+  const selectedTarget = useMemo(
+    () => targetOptions.find((target) => String(target.number) === targetNumber) ?? null,
+    [targetOptions, targetNumber],
+  );
+
+  const handleTargetChange = (value: string) => {
+    setTargetNumber(value);
+    const target = targetOptions.find((candidate) => String(candidate.number) === value);
+    setTitle(target?.title ?? "");
+  };
+
   const canSubmit =
     reposLoading === false &&
     repoFullName !== "" &&
-    numberValue !== null &&
-    Number.isInteger(numberValue) &&
-    numberValue > 0 &&
+    targetNumber !== "" &&
     baseBranch.trim() !== "" &&
     submitting === false;
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!canSubmit || numberValue === null) return;
+    if (!canSubmit || !selectedTarget) return;
     setSubmitting(true);
     setError(null);
     try {
       const payload = await startRun({
         repo_full_name: repoFullName,
         kind,
-        number: numberValue,
-        title: title.trim() !== "" ? title.trim() : undefined,
+        number: selectedTarget.number,
+        title: title.trim() !== "" ? title.trim() : selectedTarget.title,
         base_branch: baseBranch.trim(),
       });
       router.push(`/runs/${payload.run_id}`);
@@ -145,7 +193,7 @@ export default function NewRunPage() {
               ) : (
                 <select
                   value={repoFullName}
-                  onChange={(event) => setRepoFullName(event.target.value)}
+                  onChange={(event) => handleRepoChange(event.target.value)}
                   className="h-9 w-full cursor-pointer rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 mt-1"
                 >
                   <option value="">Select a repository…</option>
@@ -165,49 +213,85 @@ export default function NewRunPage() {
               )}
             </div>
 
-            <div className="space-y-2">
-              <label className="text-xs font-medium text-muted-foreground ml-1">Kind</label>
-              <div className="flex gap-2">
-                {(["issue", "pr"] as RunKind[]).map((value) => (
-                  <Button
-                    key={value}
-                    type="button"
-                    variant={kind === value ? "default" : "outline"}
-                    size="sm"
-                    className="cursor-pointer capitalize mt-1 ml-1"
-                    onClick={() => setKind(value)}
-                  >
-                    {value}
-                  </Button>
-                ))}
-              </div>
-            </div>
-
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <label className="text-xs font-medium text-muted-foreground ml-1">
-                  {kind === "issue" ? "Issue number" : "PR number"}
-                </label>
-                <input
-                  type="number"
-                  min={1}
-                  step={1}
-                  inputMode="numeric"
-                  value={number}
-                  onChange={(event) => setNumber(event.target.value)}
-                  placeholder="e.g. 11"
-                  className="h-9 w-full rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 mt-1"
-                />
+                <label className="text-xs font-medium text-muted-foreground ml-1">Kind</label>
+                <div className="flex gap-2">
+                  {(["issue", "pr"] as RunKind[]).map((value) => (
+                    <Button
+                      key={value}
+                      type="button"
+                      variant={kind === value ? "default" : "outline"}
+                      size="sm"
+                      className="cursor-pointer capitalize mt-1 ml-1"
+                      onClick={() => handleKindChange(value)}
+                    >
+                      {value}
+                    </Button>
+                  ))}
+                </div>
               </div>
               <div className="space-y-2">
                 <label className="text-xs font-medium text-muted-foreground ml-1">Base branch</label>
                 <input
                   value={baseBranch}
                   onChange={(event) => setBaseBranch(event.target.value)}
-                  placeholder="main"
+                  placeholder={selectedRepo?.default_branch ?? "main"}
                   className="h-9 w-full rounded-lg border bg-background px-3 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 mt-1"
                 />
               </div>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs font-medium text-muted-foreground ml-1">
+                {kind === "issue" ? "Issue" : "Pull request"}
+              </label>
+              {targetsLoading ? (
+                <Skeleton className="h-9 w-full mt-1" />
+              ) : targetError ? (
+                <div className="flex items-center justify-between gap-3 rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-2.5">
+                  <p className="text-sm text-destructive">{targetError}</p>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void loadTargets(repoFullName)}
+                  >
+                    <RefreshCw className="size-3.5" />
+                    Retry
+                  </Button>
+                </div>
+              ) : (
+                <select
+                  value={targetNumber}
+                  onChange={(event) => handleTargetChange(event.target.value)}
+                  disabled={!repoFullName || targetOptions.length === 0}
+                  className="h-9 w-full cursor-pointer rounded-lg border bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 mt-1 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <option value="">
+                    {!repoFullName
+                      ? "Select a repository first…"
+                      : targetOptions.length === 0
+                        ? `No ${kind === "issue" ? "issues" : "pull requests"} found`
+                        : `Select an ${kind === "issue" ? "issue" : "PR"}…`}
+                  </option>
+                  {targetOptions.map((target) => (
+                    <option key={target.number} value={String(target.number)}>
+                      #{target.number} · {target.title} ({target.state}
+                      {target.merged_at ? " · merged" : ""})
+                    </option>
+                  ))}
+                </select>
+              )}
+              {repoFullName && !targetsLoading && !targetError && (
+                <p className="text-xs text-muted-foreground ml-1">
+                  {targetOptions.length}{" "}
+                  {kind === "issue"
+                    ? `${targetOptions.length === 1 ? "issue" : "issues"}`
+                    : `${targetOptions.length === 1 ? "PR" : "PRs"}`}{" "}
+                  available
+                </p>
+              )}
             </div>
 
             <div className="space-y-2">

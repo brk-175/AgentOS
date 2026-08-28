@@ -124,3 +124,68 @@ async def test_get_repository_404(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(github.GitHubClientError) as excinfo:
         await github.get_repository("gho_test", "octo/private-repo")
     assert excinfo.value.status == 404
+
+
+ISSUE_1 = {
+    "number": 11,
+    "title": "Remove futile tabs",
+    "state": "open",
+    "created_at": "2026-08-01T10:00:00Z",
+    "updated_at": "2026-08-02T10:00:00Z",
+}
+PR_ITEM = {
+    "number": 12,
+    "title": "Fix shimmer button speed",
+    "state": "open",
+    "created_at": "2026-08-03T10:00:00Z",
+    "updated_at": "2026-08-03T11:00:00Z",
+    "pull_request": {"url": "https://api.github.com/repos/octo/demo/pulls/12"},
+}
+PULL_1 = {
+    "number": 12,
+    "title": "Fix shimmer button speed",
+    "state": "closed",
+    "created_at": "2026-08-03T10:00:00Z",
+    "updated_at": "2026-08-04T10:00:00Z",
+    "merged_at": "2026-08-04T11:00:00Z",
+}
+
+
+async def test_list_issues_filters_out_pull_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/octo/demo/issues"
+        assert request.headers["authorization"] == "Bearer gho_test"
+        return httpx.Response(200, json=[ISSUE_1, PR_ITEM])
+
+    _mock_client(monkeypatch, handler)
+    result = await github.list_issue_pulls("gho_test", "octo/demo", "issue")
+    assert len(result) == 1
+    assert result[0].kind == "issue"
+    assert result[0].number == 11
+    assert result[0].title == "Remove futile tabs"
+    assert result[0].merged_at is None
+
+
+async def test_list_pull_requests_reports_merged_at(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/octo/demo/pulls"
+        return httpx.Response(200, json=[PULL_1])
+
+    _mock_client(monkeypatch, handler)
+    result = await github.list_issue_pulls("gho_test", "octo/demo", "pr")
+    assert len(result) == 1
+    assert result[0].kind == "pr"
+    assert result[0].number == 12
+    assert result[0].merged_at == "2026-08-04T11:00:00Z"
+
+
+async def test_list_issue_pulls_maps_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"message": "rate limit"})
+
+    _mock_client(monkeypatch, handler)
+    with pytest.raises(github.GitHubClientError) as excinfo:
+        await github.list_issue_pulls("gho_test", "octo/demo", "issue")
+    assert excinfo.value.status == 403

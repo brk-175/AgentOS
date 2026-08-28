@@ -164,3 +164,60 @@ async def test_search_validates_query_length(
     await _auth_cookie(client, db_factory)
     response = await client.get(f"{API_PREFIX}/repos/octocat/AgentOS/search", params={"q": "x"})
     assert response.status_code == 422
+
+
+async def test_targets_lists_issues_for_repo(
+    repos_env: tuple[httpx.AsyncClient, pytest.MonkeyPatch],
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    client, monkeypatch = repos_env
+    await _auth_cookie(client, db_factory)
+    captured: dict[str, Any] = {}
+
+    async def fake_list(token: str, repo: str, kind: str) -> list[Any]:
+        captured["token"] = token
+        captured["repo"] = repo
+        captured["kind"] = kind
+        from agentos.services.github import IssuePull
+
+        return [
+            IssuePull(
+                kind="issue",
+                number=11,
+                title="Remove futile tabs",
+                state="open",
+                created_at="2026-08-01T10:00:00Z",
+                updated_at="2026-08-02T10:00:00Z",
+            )
+        ]
+
+    monkeypatch.setattr("agentos.api.repos.github.list_issue_pulls", fake_list)
+
+    response = await client.get(
+        f"{API_PREFIX}/repos/octocat/AgentOS/targets", params={"kind": "issue"}
+    )
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "kind": "issue",
+            "number": 11,
+            "title": "Remove futile tabs",
+            "state": "open",
+            "created_at": "2026-08-01T10:00:00Z",
+            "updated_at": "2026-08-02T10:00:00Z",
+            "merged_at": None,
+        }
+    ]
+    assert captured == {
+        "token": "gho_test_access_token",
+        "repo": "octocat/AgentOS",
+        "kind": "issue",
+    }
+
+
+async def test_targets_requires_auth(
+    repos_env: tuple[httpx.AsyncClient, pytest.MonkeyPatch],
+) -> None:
+    client, _ = repos_env
+    response = await client.get(f"{API_PREFIX}/repos/octocat/AgentOS/targets")
+    assert response.status_code == 401

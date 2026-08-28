@@ -20,6 +20,16 @@ export interface Repo {
   html_url: string;
 }
 
+export interface RepoTarget {
+  kind: "issue" | "pr";
+  number: number;
+  title: string;
+  state: string;
+  created_at: string;
+  updated_at: string;
+  merged_at: string | null;
+}
+
 export class ApiError extends Error {
   constructor(
     public readonly status: number,
@@ -56,6 +66,15 @@ export function getMe(): Promise<Me> {
 
 export function getRepos(): Promise<Repo[]> {
   return getJSON<Repo[]>("/api/v1/repos");
+}
+
+export function getTargets(
+  repoFullName: string,
+  kind: "issue" | "pr",
+): Promise<RepoTarget[]> {
+  return getJSON<RepoTarget[]>(
+    `/api/v1/repos/${encodeURIComponent(repoFullName)}/targets?kind=${kind}`,
+  );
 }
 
 export async function logout(): Promise<void> {
